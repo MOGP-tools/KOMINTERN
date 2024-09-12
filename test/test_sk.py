@@ -56,7 +56,10 @@ def compare_df(df_ref, df, tolerance = 1e-8):
 
         return False, msg
 
-
+def test_dif():
+    # WIP
+    test, msg = compare_df(df_ref, df_ref, tolerance = 1e-8)
+    assert test, msg
 
 if __name__ == "__main__" :
-    to_do()
+    # TO DO

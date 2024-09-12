@@ -12,7 +12,7 @@ torch.manual_seed(12)
 torch.backends.cuda.matmul.allow_tf32 = False
 import gpytorch as gp
 
-from custom_profiler import profiler, magic_profiler #pip install git+https://github.com/KarGeekrie/customProfiler.git
+from custom_profiler import profiler, magic_profiler # info : https://github.com/KarGeekrie/customProfiler
 
 def testHelloWorld():
     print("Hello")
