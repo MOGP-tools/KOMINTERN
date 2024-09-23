@@ -1,25 +1,30 @@
 from functools import reduce #, lru_cache
 from typing import Union, List
 import warnings
+import numpy as np
 import torch
 import gpytorch as gp
 from gpytorch.means.mean import Mean
 from gpytorch.kernels.kernel import Kernel
 from gpytorch.likelihoods.likelihood import Likelihood
 from torch import Tensor
-from utilities import handle_covar_ 
+
+from .utilities import handle_covar_ 
 
 class ExactGPModel(gp.models.ExactGP):
     """
     Standard exact GP model. Can handle independant multitasking via batch dimensions
     """
-    def __init__( self, train_x:Tensor, train_y:Tensor, likelihood:Likelihood,
+    def __init__( self, train_x:Tensor, train_y:Tensor, likelihood:Union[Likelihood,None]=None,
                   n_tasks: int = 1, prior_scales:Union[Tensor, None]=None,
                   prior_width:Union[Tensor, None]=None, mean_type:Mean=gp.means.ConstantMean,
                   decomp:Union[List[List[int]], None]=None, outputscales:bool=False,
                   kernel_type:Kernel=gp.kernels.RBFKernel,
                   ker_kwargs:Union[dict,None]=None,
                   n_inducing_points:Union[int,None]=None,
+                  noise_thresh:float=1e-6,
+                  batch_lik:bool=False,
+                  jitter_val:float=1e-6,
                   **kwargs ):
         """
         Args:
@@ -36,6 +41,20 @@ class ExactGPModel(gp.models.ExactGP):
             ker_kwargs: Additional arguments to pass to the gp kernel function. Defaults to None.
             n_inducing_points: if an integer is provided, the model will use the sparse GP approximation of Titsias (2009).
         """
+        if likelihood is None:
+            if n_tasks == 1:
+                likelihood = gp.likelihoods.GaussianLikelihood(noise_constraint=gp.constraints.GreaterThan(noise_thresh))
+                likelihood.noise = noise_thresh
+            elif batch_lik :
+                likelihood = gp.likelihoods.GaussianLikelihood(batch_shape=torch.Size([n_tasks]),
+                                                    noise_constraint=gp.constraints.GreaterThan(noise_thresh))
+                likelihood.noise = noise_thresh * torch.ones_like(likelihood.noise)
+            else:
+                likelihood = gp.likelihoods.MultitaskGaussianLikelihood(num_tasks=n_tasks,
+                                                    noise_constraint=gp.constraints.GreaterThan(noise_thresh))
+                likelihood.noise = noise_thresh
+                likelihood.task_noises = torch.ones(n_tasks, device=train_y.device) * noise_thresh
+                
         super(ExactGPModel, self).__init__(train_x, train_y, likelihood)
 
         if ker_kwargs is None:
@@ -49,6 +68,11 @@ class ExactGPModel(gp.models.ExactGP):
                                           n_funcs=n_tasks, ker_kwargs=ker_kwargs)
         if n_inducing_points is not None:
             self.covar_module = gp.kernels.InducingPointKernel(self.covar_module, torch.randn(n_inducing_points, self.dim), likelihood)
+        
+        if jitter_val is None:
+            self.jitter_val = gp.settings.cholesky_jitter.value(train_x.dtype)
+        else:
+            self.jitter_val = jitter_val
 
 
     def forward( self, x:Tensor )-> Union[gp.distributions.MultivariateNormal, gp.distributions.MultitaskMultivariateNormal]:
@@ -116,13 +140,25 @@ class ExactGPModel(gp.models.ExactGP):
         K_plus = self.prediction_strategy.lik_train_train_covar.evaluate_kernel().to_dense()
         return torch.linalg.cond(K_plus)
     
-    def compute_loo(self, output=None, complex_mean=False, eps=1e-6):
+    def compute_loo(self, output=None, complex_mean=False):
         train_x, train_y = self.train_inputs[0], self.train_targets
         likelihood = self.likelihood
+        eps = self.jitter_val
         if self.n_tasks > 1:
             loo_var, loo_delta = torch.zeros_like(train_y), torch.zeros_like(train_y)
+            ## The following blocks are leads for a more efficient implementation of the LOO computation in the multitask case. 
+            ## Not yet functional because of bugs in gpytorch
+            ###
             # K = likelihood(output).to_data_independent_dist().lazy_covariance_matrix
             # Kbatch = output.lazy_covariance_matrix.base_linear_op.detach().to_dense() # to be removed later. A bug in gpytorch makes this necessary
+            ###
+            # K = likelihood(output).lazy_covariance_matrix
+            # identity = torch.eye(*K.shape[-2:], dtype=K.dtype, device=K.device)
+            # L = K.cholesky(upper=False)
+            # loo_var = 1.0 / L._cholesky_solve(identity[None,:], upper=False).diagonal(dim1=-1, dim2=-2)
+            # loo_delta = L._cholesky_solve(targets.unsqueeze(-1), upper=False).squeeze(-1) * loo_var
+            # loo_var, loo_delta = loo_var.detach().T, loo_delta.detach().T
+            ###
             if hasattr(output.lazy_covariance_matrix, 'base_linear_op'):
                 Kbatch = output.lazy_covariance_matrix.base_linear_op.evaluate() # to be removed later. A bug in gpytorch makes this necessary
             else:
@@ -130,19 +166,12 @@ class ExactGPModel(gp.models.ExactGP):
             global_noise = likelihood.noise.squeeze().data if hasattr(likelihood, 'noise') else 0
             m = self.mean_module(train_x).reshape(*train_y.shape)
             targets = (train_y - m).T
-            # K = likelihood(output).lazy_covariance_matrix
-            # identity = torch.eye(*K.shape[-2:], dtype=K.dtype, device=K.device)
-            # L = K.cholesky(upper=False)
-            # loo_var = 1.0 / L._cholesky_solve(identity[None,:], upper=False).diagonal(dim1=-1, dim2=-2)
-            # loo_delta = L._cholesky_solve(targets.unsqueeze(-1), upper=False).squeeze(-1) * loo_var
-            # loo_var, loo_delta = loo_var.detach().T, loo_delta.detach().T
             for i in range(self.n_tasks):
                 K = Kbatch[i]
                 noise = global_noise + likelihood.task_noises.squeeze().data[i]
                 identity = torch.eye(*K.shape[-2:], dtype=K.dtype, device=K.device)
-                # identity_op = IdentityLinearOperator(diag_shape=K.shape[0], dtype=K.dtype, device=K.device)
                 K += noise * identity
-                while eps < 1.: # this is a hack to avoid numerical instability
+                while eps < 1e6 * self.jitter_val: # this is a hack to avoid numerical instability
                     try:
                         L = K.cholesky(upper=False)
                         break
@@ -159,8 +188,8 @@ class ExactGPModel(gp.models.ExactGP):
             m, K, noise_it = self.mean_module(train_x), output.lazy_covariance_matrix, self.likelihood.noise.data
             m = m.reshape(*train_y.shape)
             identity = torch.eye(*K.shape[-2:], dtype=K.dtype, device=K.device)
-            noise_val = max(noise_it, eps)
-            K += noise_val * identity
+            # noise_val = max(noise_it, eps)
+            # K += noise_val * identity
             with gp.settings.cholesky_max_tries(3):
                 if complex_mean:
                     if not hasattr(self.mean_module, 'basis_matrix'):
@@ -182,3 +211,6 @@ class ExactGPModel(gp.models.ExactGP):
                     loo_delta = L._cholesky_solve((train_y - m).unsqueeze(-1), upper=False).squeeze(-1) * loo_var
 
         return loo_var, loo_delta
+    
+    def default_mll(self):
+        return gp.mlls.ExactMarginalLogLikelihood(self.likelihood, self)

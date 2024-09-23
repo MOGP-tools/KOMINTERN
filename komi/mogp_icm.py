@@ -9,16 +9,20 @@ from torch import Tensor
 import gpytorch as gp
 from gpytorch.likelihoods.likelihood import Likelihood
 from linear_operator.operators import PsdSumLinearOperator
-from komi.utilities import init_lmc_coefficients
-from base_gp import ExactGPModel
+
+from .utilities import init_lmc_coefficients
+from .base_gp import ExactGPModel
 
 class MultitaskGPModel(ExactGPModel):
     """
     A multitask GP model with exact GP treatment. This class encompasses both ICM and naive LMC models.
     """
-    def __init__( self, train_x: Tensor, train_y: Tensor, likelihood: Likelihood,
-                  n_tasks: int, n_latents: int, model_type:str='ICM', init_lmc_coeffs:bool=True,
-                  fix_diagonal:bool=True, diag_value:float=2*torch.finfo(torch.get_default_dtype()).tiny, **kwargs):
+    def __init__( self, train_x: Tensor, train_y: Tensor, n_latents: int, 
+                  likelihood:Union[Likelihood,None]=None, model_type:str='ICM', init_lmc_coeffs:bool=True,
+                  fix_diagonal:bool=True, diag_value:float=16*torch.finfo(torch.get_default_dtype()).tiny, 
+                  noise_thresh:float=1e-4,
+                  outputscales:bool=False,
+                  **kwargs):
         """Initialization of the model. Note that the optional arguments of the ExactGPModel also apply here thanks to the inheritance.
 
         Args:
@@ -31,8 +35,14 @@ class MultitaskGPModel(ExactGPModel):
             init_lmc_coeffs: if True, initializes LMC coefficients with SVD of the training labels ; else inializes with samples from standard normal distributions. Defaults to True
             fix_diagonal: for ICM only. If True, fixes the learned diagonal term of the task covariance matrix, accounting for task-specific (non-shared) latent processes. Defaults to False
         """
-
-        super(MultitaskGPModel, self).__init__(train_x, train_y, likelihood, n_tasks=1, outputscales=False, **kwargs) # we build upon a single-task GP, created by calling parent class
+        n_data, n_tasks = train_y.shape
+        if likelihood is None:
+            likelihood = gp.likelihoods.MultitaskGaussianLikelihood(num_tasks=n_tasks,
+                                                    noise_constraint=gp.constraints.GreaterThan(noise_thresh))
+            likelihood.noise = noise_thresh
+            likelihood.task_noises = torch.ones(n_tasks, device=train_y.device) * noise_thresh
+            
+        super(MultitaskGPModel, self).__init__(train_x, train_y, likelihood, n_tasks=1, outputscales=outputscales, **kwargs) # we build upon a single-task GP, created by calling parent class
 
         self.mean_module = gp.means.MultitaskMean(self.mean_module, num_tasks=n_tasks)
         
@@ -43,7 +53,7 @@ class MultitaskGPModel(ExactGPModel):
                                                            num_tasks=n_tasks, rank=1)
 
         if init_lmc_coeffs:
-            lmc_coeffs = init_lmc_coefficients(train_y, n_latents)
+            lmc_coeffs = init_lmc_coefficients(train_y, n_latents).T
             if model_type=='ICM':
                 # this parameter has already been initialized with random values at the instantiation of the variational strategy, so registering it anew is facultative
                 self.covar_module.task_covar_module.register_parameter(name='covar_factor', parameter=torch.nn.Parameter(lmc_coeffs))
@@ -57,14 +67,15 @@ class MultitaskGPModel(ExactGPModel):
         if fix_diagonal:
             if model_type=='ICM':
                 self.covar_module.task_covar_module.register_parameter(name='raw_var',
-                                            parameter=torch.nn.Parameter(torch.log(diag_value)*torch.ones(n_tasks, device=train_y.device),
+                                            parameter=torch.nn.Parameter(np.log(diag_value)*torch.ones(n_tasks, device=train_y.device),
                                             requires_grad=False))
             elif model_type=='LMC':
                 for i in range(len(self.covar_module.covar_module_list)):
                     self.covar_module.covar_module_list[i].task_covar_module.register_parameter(name='raw_var',
-                                                parameter=torch.nn.Parameter(torch.log(diag_value)*torch.ones(n_tasks, device=train_y.device),
+                                                parameter=torch.nn.Parameter(np.log(diag_value)*torch.ones(n_tasks, device=train_y.device),
                                                 requires_grad=False))
                 
+        self.outputscales = outputscales
         self.n_tasks, self.n_latents, self.model_type = n_tasks, n_latents, model_type
 
     def lmc_coefficients( self )-> Tensor:
@@ -216,20 +227,22 @@ class MultitaskGPModel(ExactGPModel):
         second_term = torch.cat(second_term_results)
         return torch.clamp(first_term - second_term, min=1e-6)
 
+    #This function is very slow, it doesn't seem to fully leverage gpytorch's internals for efficient ICM algebra. To be improved
     def compute_loo(self, output=None):
         train_x, train_y = self.train_inputs[0], self.train_targets        
-        if output is None:
-            output = self.forward(train_x)
-        m, K = self.mean_module(train_x), self.likelihood(output).lazy_covariance_matrix
-        m = m.reshape(*train_y.shape)
-        targets = torch.reshape(train_y - m, (np.prod(train_y.shape).astype(int),1))
-        with gp.settings.cholesky_max_tries(6):
+        with gp.settings.cholesky_max_tries(6), \
+            torch.no_grad():
+            if output is None:
+                output = self.forward(train_x)
+            m, K = self.mean_module(train_x), self.likelihood(output).lazy_covariance_matrix
+            m = m.reshape(*train_y.shape)
+            targets = torch.reshape(train_y - m, (np.prod(train_y.shape).astype(int),1))
             L = K.cholesky(upper=False)
             identity = torch.eye(*K.shape[-2:], dtype=K.dtype, device=K.device)
             loo_var = 1.0 / L._cholesky_solve(identity, upper=False).diagonal(dim1=-1, dim2=-2)
             loo_delta = L._cholesky_solve(targets, upper=False).squeeze(-1) * loo_var
-        loo_var = torch.reshape(loo_var.detach(), train_y.shape)
-        loo_delta = torch.reshape(loo_delta.detach(), train_y.shape)
+            loo_var = torch.reshape(loo_var.detach(), train_y.shape)
+            loo_delta = torch.reshape(loo_delta.detach(), train_y.shape)
         return loo_var, loo_delta
     
     def save( self):
@@ -246,13 +259,16 @@ class MultitaskGPModel(ExactGPModel):
             dico['outputscales'] = self.outputscale().tolist()
         dico['lscales'] = self.lscales().tolist()
         with gp.beta_features.checkpoint_kernel(0),\
-                gp.settings.skip_posterior_variances(state=True):
+                gp.settings.skip_posterior_variances(state=True),\
+                torch.no_grad():
             _ = self(torch.zeros_like(self.train_inputs[0])) # to compute the mean_cache
             gp_cache = self.prediction_strategy.mean_cache
-            n_points, n_tasks = self.train_inputs[0].shape
+            n_points, n_tasks = self.train_targets.shape
             res = gp_cache.reshape((n_points, n_tasks)).matmul(self.covar_module.task_covar_module.covar_matrix)
             dico['mean_cache'] = res.detach().tolist()
         
         return dico
 
+    def default_mll(self):
+        return gp.mlls.ExactMarginalLogLikelihood(self.likelihood, self)
 

@@ -7,8 +7,10 @@ from torch import Tensor
 import gpytorch as gp
 from gpytorch.means.mean import Mean
 from gpytorch.kernels.kernel import Kernel
+from gpytorch.likelihoods.likelihood import Likelihood
 from scipy.stats import qmc
-from komi.utilities import init_lmc_coefficients, handle_covar_
+
+from .utilities import init_lmc_coefficients, handle_covar_
 
 class CustomLMCVariationalStrategy(gp.variational.LMCVariationalStrategy):  # allows to put means on tasks instead of latent processes
     """
@@ -41,14 +43,17 @@ class VariationalMultitaskGPModel(gp.models.ApproximateGP):
     """
     A standard variational LMC model using gp functionalities.
     """
-    def __init__( self, train_x:Tensor, n_latents:int, n_tasks:int, train_ind_ratio:float=1.5, seed:int=0,
+    def __init__( self, train_x:Tensor, n_latents:int, n_tasks:int, likelihood:Union[Likelihood,None]=None, 
+                 train_ind_ratio:float=1.5, seed:int=0,
                   init_lmc_coeffs:bool=False, train_y:Union[Tensor,None]=None, prior_scales:Tensor=None, prior_width:Tensor=None,
                   mean_type:Mean=gp.means.ConstantMean, kernel_type:Kernel=gp.kernels.RBFKernel,
                   outputscales:bool=False, 
                   decomp:Union[List[List[int]],None]=None,
                   distrib:gp.variational._VariationalDistribution=gp.variational.CholeskyVariationalDistribution, 
                   var_strat:gp.variational._VariationalStrategy=gp.variational.VariationalStrategy,
-                  ker_kwargs:Union[dict,None]=None, **kwargs):
+                  noise_thresh:float=1e-4,
+                  ker_kwargs:Union[dict,None]=None, 
+                  **kwargs):
         """
         Args:
             train_x: training input data
@@ -70,7 +75,7 @@ class VariationalMultitaskGPModel(gp.models.ApproximateGP):
 
         if ker_kwargs is None:
             ker_kwargs = {}
-        self.dim = train_x.shape[1]
+        self.n_points, self.dim = train_x.shape
         if train_y is not None and train_y.shape[1]!=n_tasks:
             n_tasks = train_y.shape[1]
             warnings.warn('Number of tasks in the training labels does not match the specified number of tasks. Defaulting to the number of tasks in the training labels.')
@@ -83,7 +88,7 @@ class VariationalMultitaskGPModel(gp.models.ApproximateGP):
             distrib = gp.variational.CholeskyVariationalDistribution  #better compatibility in this case
         else:
             learn_inducing_locations = True
-            n_ind_points = int(np.floor(train_x.shape[0] / train_ind_ratio))
+            n_ind_points = int(np.floor(self.n_points / train_ind_ratio))
             sampler = qmc.LatinHypercube(d=self.dim, seed=seed)
             inducing_points = torch.as_tensor(2 * sampler.random(n=n_ind_points) - 1, dtype=train_x.dtype)
             #same inducing points for all latents here
@@ -97,7 +102,8 @@ class VariationalMultitaskGPModel(gp.models.ApproximateGP):
             strategy,
             num_tasks=n_tasks,
             num_latents=n_latents,
-            latent_dim=-1)
+            latent_dim=-1,
+            **kwargs)
 
         super().__init__(variational_strategy)
 
@@ -105,6 +111,13 @@ class VariationalMultitaskGPModel(gp.models.ApproximateGP):
                                             prior_width=prior_width, n_funcs=n_latents, ker_kwargs=ker_kwargs, outputscales=outputscales)
         self.mean_module = gp.means.ZeroMean(batch_shape=torch.Size([n_latents])) #in gp, latent processes can have non-zero means, which we wish to avoid
 
+        if likelihood is None:
+            likelihood = gp.likelihoods.MultitaskGaussianLikelihood(num_tasks=n_tasks,
+                                                                    noise_constraint=gp.constraints.GreaterThan(noise_thresh))
+            likelihood.noise = noise_thresh
+            likelihood.task_noises = torch.ones(n_tasks, device=train_y.device) * noise_thresh
+
+        self.likelihood = likelihood
         self.n_tasks, self.n_latents, self.decomp = n_tasks, n_latents, decomp
         self.outputscales = outputscales
 
@@ -167,21 +180,24 @@ class VariationalMultitaskGPModel(gp.models.ApproximateGP):
     def compute_latent_distrib( self, x, prior=False, **kwargs):
         return self.base_variational_strategy(x, prior=prior, **kwargs)
     
-    def save( self, likelihood):
+    def save( self):
         dico = {}
+        likelihood = self.likelihood
         dico['lmc_coeffs'] = self.lmc_coefficients().detach().tolist()
         noises = likelihood.noise.detach() if hasattr(likelihood, 'noise') else 0.
         if hasattr(likelihood, 'task_noises'):
-            noises = self.likelihood.task_noises.detach() + noises
+            noises = likelihood.task_noises.detach() + noises
         elif hasattr(likelihood, 'task_noise_covar'):
             dico['task_noise_covar'] = likelihood.task_noise_covar.detach().tolist()
         dico['noises'] = noises.tolist()
         if self.outputscales:
             dico['outputscales'] = self.outputscale().tolist()
         dico['lscales'] = self.lscales().tolist()
-        with gp.settings.skip_posterior_variances(state=True):
-            _ = self(torch.zeros_like(self.train_inputs[0])) # this is to compute the mean cache
-        if not isinstance(self.variational_strategy, gp.variational.UnwhitenedVariationalStrategy):
+        inducing_points = self.variational_strategy.base_variational_strategy.inducing_points.detach()
+        dico['inducing_points'] = inducing_points.tolist()
+        with gp.settings.skip_posterior_variances(state=True), torch.no_grad():
+            _ = self(torch.zeros_like(inducing_points)) # this is to compute the mean cache
+        if not isinstance(self.variational_strategy.base_variational_strategy, gp.variational.UnwhitenedVariationalStrategy):
             warnings.warn('Model storage has only been tested for the UnwhitenedVariationalStrategy of gpytorch. \
                            The current strategy may not be supported.')
         dico['mean_cache'] = self.variational_strategy.base_variational_strategy._mean_cache.squeeze().detach().tolist()
@@ -189,8 +205,10 @@ class VariationalMultitaskGPModel(gp.models.ApproximateGP):
             dico['distrib_covar'] = self.variational_strategy.base_variational_strategy._variational_distribution.chol_variational_covar.detach().tolist()
         else:
             warnings.warn('The variational covariance was not stored, either deliberately (delta variational distribution) or because a nonstandard distribution was used.')
-        dico['inducing_points'] = self.variational_strategy.base_variational_strategy.inducing_points.detach().tolist()
         return dico
+    
+    def default_mll(self):
+        return gp.mlls.VariationalELBO(self.likelihood, self, num_data=self.n_points)
 
 
 

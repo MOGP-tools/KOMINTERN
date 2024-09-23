@@ -12,15 +12,20 @@ from sklearn.utils.extmath import randomized_svd
 ## Custom means and kernels
 
 class SplineKernel(gp.kernels.Kernel):
-    is_stationary = True
+    is_stationary = False
 
     def forward(self, x1, x2, diag=False, **params):
         if diag:
             return (1 + x1**2 + x1**3 / 3).prod(dim=-1)
         mins = torch.min(x1.unsqueeze(-2), x2.unsqueeze(-3))
         maxes = torch.max(x1.unsqueeze(-2), x2.unsqueeze(-3))
-        oned_vals = 1 + mins*maxes + 0.5 * mins**2 * (maxes - mins/3) 
-        return oned_vals.prod(dim=-1)
+        oned_vals = 1 + mins*maxes + 0.5 * mins**2 * (maxes - mins/3)
+        res = oned_vals.prod(dim=-1)
+        ## !! The following block is a workaround to handle batched inputs for nonstationary kernels. It should be removed when gpytorch is fixed
+        if hasattr(self, 'batch_shape') and self.batch_shape and self.batch_shape != x1.shape[:-2]:
+            batch_dim = -1 if params.get("last_dim_is_batch", False) else 0
+            res = res.unsqueeze(batch_dim).expand(*self.batch_shape, *res.shape)
+        return res
 
 class PolynomialMean(gp.means.mean.Mean):
     def __init__( self, input_size, batch_shape=torch.Size(), bias=True, degree=3):
@@ -81,8 +86,7 @@ class LeaveOneOutPseudoLikelihood(gp.mlls.exact_marginal_log_likelihood.ExactMar
 
     def forward( self, function_dist: gp.distributions.MultivariateNormal, target: Tensor, *params ) -> Tensor:
         output = self.likelihood(function_dist, *params)
-        sigma2, target_minus_mu = self.model.compute_loo(output, self.train_x, self.train_y, self.model, likelihood=self.likelihood,
-                                              multitask=isinstance(self.model, VariationalMultitaskGPModel))
+        sigma2, target_minus_mu = self.model.compute_loo(output)
         term1 = -0.5 * sigma2.log()
         term2 = -0.5 * target_minus_mu.pow(2.0) / sigma2
         res = (term1 + term2).sum(dim=-1)
@@ -178,10 +182,11 @@ def init_lmc_coefficients( train_y: Tensor, n_latents: int, QR_form:bool=False):
         S = 1e-3 * torch.ones(n_latents, device=train_y.device, dtype=train_y.dtype)
         S[:n_data] = torch.as_tensor(np.diag(R).copy(), device=train_y.device, dtype=train_y.dtype)
         U = torch.as_tensor(Q[:,:n_latents], device=train_y.device, dtype=train_y.dtype)
+    S = S / np.sqrt(n_data - 1)
     if QR_form:
         return U, S
     else:
-        y_transformed = U * S / np.sqrt(n_data - 1)
+        y_transformed = U * S
     return y_transformed.T
 
 def transfo_mesh( array, return_coeffs=False, value=None, reverse=False):
@@ -197,6 +202,9 @@ def transfo_mesh( array, return_coeffs=False, value=None, reverse=False):
         return m * value + p
     else:
         return m * array + p
+    
+def max_norm_func( x: Tensor, axis: int = -1):
+    return torch.max(torch.abs(x), dim=axis).values
 ##----------------------------------------------------------------------------------------------------------------------
 
 ## Parametrizations

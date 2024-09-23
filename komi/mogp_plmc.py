@@ -9,8 +9,10 @@ from gpytorch.means.mean import Mean
 from gpytorch.likelihoods.likelihood import Likelihood
 from linear_operator.operators import KroneckerProductLinearOperator, RootLinearOperator
 from linear_operator.operators.dense_linear_operator import to_linear_operator
-from komi.utilities import init_lmc_coefficients, ScalarParam, PositiveDiagonalParam, LowerTriangularParam
-from base_gp import ExactGPModel
+from sklearn.utils.extmath import randomized_svd
+
+from .utilities import init_lmc_coefficients, ScalarParam, PositiveDiagonalParam, LowerTriangularParam, UpperTriangularParam
+from .base_gp import ExactGPModel
 
 ## making the mixing matrix a separate class allows to call torch.nn.utils.parametrizations.orthogonal
 ## onto it during instanciation of a ProjectedGPModel
@@ -92,10 +94,11 @@ class ProjectedGPModel(ExactGPModel):
     """
     The projected LMC from the reference article.
     """
-    def __init__( self, train_x:Tensor, train_y:Tensor, n_tasks:int, n_latents:int, proj_likelihood:Union[None,Likelihood]=None, 
+    def __init__( self, train_x:Tensor, train_y:Tensor, n_latents:int, proj_likelihood:Union[None,Likelihood]=None, 
                   init_lmc_coeffs:bool=False, BDN:bool=True, diagonal_B:bool=False, scalar_B:bool=False, diagonal_R:bool=False,
-                  mean_type:Mean=gp.means.ConstantMean, ortho_param='matrix_exp', bulk=True,
-                  noise_thresh:float=1e-4, noise_init:float=1e-2, outputscales:bool=False, eps=1e-3, **kwargs):
+                  mean_type:Mean=gp.means.ZeroMean, ortho_param='matrix_exp', bulk=True,
+                  noise_thresh:float=1e-4, noise_init:float=1e-2, outputscales:bool=False,
+                  jitter_val:Union[float,None]=None, **kwargs):
         """Initialization of the model. Note that the optional arguments of the ExactGPModel also apply here thanks to the inheritance.
         
         Args:
@@ -111,13 +114,15 @@ class ProjectedGPModel(ExactGPModel):
             diagonal_R: whether to parametrize a diagonal scale component for the mixing matrix (see reference article). Defaults to False.
             mean_type: gp mean function for task-level processes. Defaults to gp.means.ConstantMean.
         """
-        noise_thresh = np.log(noise_thresh)
         if proj_likelihood is None or proj_likelihood.noise.shape[0] != n_latents:
+            proj_likelihood = gp.likelihoods.GaussianLikelihood(batch_shape=torch.Size([n_latents]),
+                                                    noise_constraint=gp.constraints.GreaterThan(noise_thresh))
+            proj_likelihood.noise = noise_thresh * torch.ones_like(proj_likelihood.noise)
+            
+        if proj_likelihood.noise.shape[0] != n_latents:
             warnings.warn("In projected GP model the dimension of the likelihood is the number of latent processes. "
                   "Provided likelihood was the wrong shape or None, so it was replaced by a fresh one")
 
-            proj_likelihood = gp.likelihoods.GaussianLikelihood(batch_shape=torch.Size([n_latents]),
-                                                    noise_constraint=gp.constraints.GreaterThan(np.exp(noise_thresh)))
 
         super().__init__(train_x, torch.zeros_like(train_y), proj_likelihood, n_tasks=n_latents, 
                          mean_type=gp.means.ZeroMean, outputscales=outputscales, **kwargs) # !! proj_likelihood will only be named likelihood in the model
@@ -133,34 +138,10 @@ class ProjectedGPModel(ExactGPModel):
             else:
                 Q_plus, R_padded = init_lmc_coefficients(train_y, n_latents=n_tasks, QR_form=True) # Q_plus has shape n_tasks x n_tasks, R_padded has shape n_tasks x n_latents
                 R = R_padded[:n_latents]
-            # n_data, n_tasks = train_y.shape
-            # if n_data > n_tasks:
-            #     U, Sigma, VT = randomized_svd(train_y.cpu().numpy(), n_components=n_tasks, random_state=0)
-            #     Q_plus, R = torch.as_tensor(VT.T, dtype=train_y.dtype), torch.as_tensor(np.diag(Sigma[:n_latents]) / np.sqrt(n_data - 1), dtype=train_y.dtype)
-            # else:
-            #     try:
-            #         Q_plus, R_padded, Vt = torch.linalg.svd(train_y.T, full_matrices=True) 
-            #         # we perform SVD rather than QR for the case where R must be diagonal (OILMM)
-            #     except: # sklearn's randomized_svd is more stable than torch's svd in some cases
-            #         U, Sigma, Vt = randomized_svd(train_y.cpu().numpy().T, n_components=n_data, random_state=0)
-            #         Q_plus, R_padded = torch.as_tensor(U, dtype=train_y.dtype), torch.as_tensor(Sigma, dtype=train_y.dtype)
-            #     if n_latents < n_data:
-            #         R_padded = R_padded[:n_latents]
-            #     else:
-            #         R_padded, R_short = 1e-3*torch.ones(n_latents, dtype=train_y.dtype), R_padded
-            #         R_padded[:n_data] = R_short
-            #     R = torch.diag_embed(R_padded) / np.sqrt(n_data - 1)
-        else:
-            fake_coeffs = torch.randn(n_tasks, n_latents)
-            Q_plus, R_padded, Vt = torch.linalg.svd(fake_coeffs) # Q_plus has shape n_tasks x n_tasks, R_padded has shape n_tasks x n_latents
-            # we perform SVD rather than QR for the case where R must be diagonal (OILMM)
-            R = R_padded[:n_latents]
-            if scalar_B and BDN: # case of the PLMC_fast
-                Q_plus = Q_plus[:,:n_latents]
 
-        R = torch.diag_embed(R) / np.sqrt(n_data - 1)
+        R = torch.diag_embed(R)
         lmc_coefficients = LMCMixingMatrix(Q_plus, R, bulk=bulk)
-        if not bulk:
+        if diagonal_R or not bulk:
             lmc_coefficients = torch.nn.utils.parametrizations.orthogonal(lmc_coefficients, name="Q_plus", orthogonal_map=ortho_param,
                                                                         use_trivialization=(ortho_param!='householder'))  # parametrizes Q_plus as orthogonal
             if diagonal_R:
@@ -172,15 +153,15 @@ class ProjectedGPModel(ExactGPModel):
         if scalar_B:
             diagonal_B = True
             self.register_parameter("log_B_tilde", torch.nn.Parameter(np.log(noise_init) * torch.ones(n_tasks - n_latents)))
-            torch.nn.utils.parametrize.register_parametrization(self, "log_B_tilde", ScalarParam(bounds=(noise_thresh, -noise_thresh)))
+            torch.nn.utils.parametrize.register_parametrization(self, "log_B_tilde", ScalarParam(bounds=(np.log(noise_thresh), -np.log(noise_thresh))))
             if BDN:
                 self.register_buffer('Y_squared_norm', (train_y**2).sum()) # case of the PLMC_fast (term for MLL computation)
         elif diagonal_B:
             self.register_parameter("log_B_tilde", torch.nn.Parameter(np.log(noise_init)*torch.ones(n_tasks - n_latents)))
-            self.register_constraint("log_B_tilde", gp.constraints.GreaterThan(noise_thresh))
+            self.register_constraint("log_B_tilde", gp.constraints.GreaterThan(np.log(noise_thresh)))
         else:
             self.register_parameter("B_tilde_inv_chol", torch.nn.Parameter(torch.diag_embed(np.log(1/noise_init)*torch.ones(n_tasks - n_latents))))
-            torch.nn.utils.parametrize.register_parametrization(self, "B_tilde_inv_chol", LowerTriangularParam(bounds=(noise_thresh, -noise_thresh)))
+            torch.nn.utils.parametrize.register_parametrization(self, "B_tilde_inv_chol", LowerTriangularParam(bounds=(np.log(noise_thresh), -np.log(noise_thresh))))
         self.diagonal_B, self.scalar_B = diagonal_B, scalar_B
 
         if not BDN:
@@ -190,7 +171,10 @@ class ProjectedGPModel(ExactGPModel):
         self.n_latents = n_latents
         self.latent_dim = -1
         self.outputscales = outputscales
-        self.eps = eps
+        if jitter_val is None:
+            self.jitter_val = gp.settings.cholesky_jitter.value(train_x.dtype)
+        else:
+            self.jitter_val = jitter_val
 
 
     def projected_noise( self )-> Tensor:
@@ -214,11 +198,11 @@ class ProjectedGPModel(ExactGPModel):
     def project_data( self, data ):
         Q, R, Q_orth = self.lmc_coefficients.QR()
         unscaled_proj = Q.T @ data.T
-        Hpinv_times_Y = torch.linalg.solve_triangular(R, unscaled_proj, upper=True)  # shape n_latents x n_points ; opposite convention to most other quantities !!
+        Hpinv_times_Y = torch.linalg.solve_triangular(R, unscaled_proj, upper=True)  
         if hasattr(self, "M"):
             return Hpinv_times_Y + self.projected_noise()[:,None] * self.M @ Q_orth.T @ data.T
         else:
-            return Hpinv_times_Y
+            return Hpinv_times_Y # shape n_latents x n_points ; opposite convention to most other quantities !!
 
     def full_likelihood( self ):
         Q, R, Q_orth = self.lmc_coefficients.QR()
@@ -261,8 +245,8 @@ class ProjectedGPModel(ExactGPModel):
         # We use a while loop to ensure that the full noise covariance is positive definite.
         # We can deactivate gradient computation as loss computation does not involve the full likelihood
         with torch.no_grad(): 
-            eps = 1e-6
-            while eps < self.eps:
+            eps = self.jitter_val
+            while eps < 1e6 * self.jitter_val:
                 try:
                     identity = torch.eye(self.n_tasks, dtype=res.task_noise_covar.dtype, device=res.task_noise_covar.device)
                     res.task_noise_covar_factor.data = torch.linalg.cholesky(Sigma + eps*identity)
@@ -307,21 +291,22 @@ class ProjectedGPModel(ExactGPModel):
     
     def compute_loo(self, output=None, latent=False):
         train_x, train_y = self.train_inputs[0], self.train_y
-        if output is None:
-            output = self.compute_latent_distrib(train_x)
-        K = self.likelihood(output).lazy_covariance_matrix
-        y_proj = self.project_data(train_y).T
-        identity = torch.eye(*K.shape[-2:], dtype=K.dtype, device=K.device)
-        L = K.cholesky(upper=False)
-        loo_var = 1.0 / L._cholesky_solve(identity[None,:], upper=False).diagonal(dim1=-1, dim2=-2)
-        loo_delta = L._cholesky_solve(y_proj.T.unsqueeze(-1), upper=False).squeeze(-1) * loo_var
-        loo_var, loo_delta = loo_var.detach().T, loo_delta.detach().T
-        if not latent:
-            lmc_coeffs = self.lmc_coefficients()
-            e_loo_raw = (loo_delta @ lmc_coeffs)
-            diff = (self.train_y - self.project_data(self.train_y).T @ lmc_coeffs)
-            loo_delta = e_loo_raw + diff
-            loo_var = loo_var @ lmc_coeffs**2
+        with torch.no_grad():
+            if output is None:
+                output = self.compute_latent_distrib(train_x)
+            K = self.likelihood(output).lazy_covariance_matrix
+            y_proj = self.project_data(train_y)
+            identity = torch.eye(*K.shape[-2:], dtype=K.dtype, device=K.device)
+            L = K.cholesky(upper=False)
+            loo_var = 1.0 / L._cholesky_solve(identity[None,:], upper=False).diagonal(dim1=-1, dim2=-2)
+            loo_delta = L._cholesky_solve(y_proj.unsqueeze(-1), upper=False).squeeze(-1) * loo_var
+            loo_var, loo_delta = loo_var.detach().T, loo_delta.detach().T
+            if not latent:
+                lmc_coeffs = self.lmc_coefficients()
+                e_loo_raw = (loo_delta @ lmc_coeffs)
+                diff = (self.train_y - y_proj.T @ lmc_coeffs)
+                loo_delta = e_loo_raw + diff
+                loo_var = loo_var @ lmc_coeffs**2
         return loo_var, loo_delta
 
     
@@ -339,8 +324,8 @@ class ProjectedGPModel(ExactGPModel):
             dico['Sigma_orth'] = self.B_tilde_inv_chol.detach().tolist()
         if hasattr(self, 'M'):
             dico['M'] = self.M.detach().tolist()
-
-        _ = self(torch.zeros_like(self.train_inputs[0])) # this is to compute the mean cache
+        with torch.no_grad():
+            _ = self(torch.zeros_like(self.train_inputs[0])) # this is to compute the mean cache
         dico['mean_cache'] = self.prediction_strategy.mean_cache.tolist()
         dico['lscales'] = self.lscales().tolist()
         if self.outputscales:
@@ -380,9 +365,12 @@ class ProjectedGPModel(ExactGPModel):
         lmc_factor = RootLinearOperator(lmc_coefficients.unsqueeze(-1))
         latent_covar = to_linear_operator(latent_covar.evaluate())
         covar = KroneckerProductLinearOperator(latent_covar, lmc_factor).sum(latent_dim)
-        covar = covar.add_jitter(self.eps)
+        covar = covar.add_jitter(self.jitter_val)
 
         return gp.distributions.MultitaskMultivariateNormal(mean, covar)
+    
+    def default_mll(self):
+        return ProjectedLMCmll(self.likelihood, self)
     
 
 class ProjectedLMCmll(gp.mlls.ExactMarginalLogLikelihood):
