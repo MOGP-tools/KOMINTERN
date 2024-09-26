@@ -402,29 +402,40 @@ class ProjectedGPModel(ExactGPModel):
         self.train_y = targets
 
     
-    def save( self) -> dict:
+    def save( self, extra_terms=False) -> dict:
         """
         Saves the model in a dictionary. The saved elements are strictly sufficient to make mean predictions (not variances).
         !! As of now, this method cannot accommodate : non-gaussian likelihoods, variable outputscales, nontrivial kernel decompositions,
         priors on kernel hyperparameters, and additional kernel settings (the ker_kwargs argument of the model). !!
+        Args:
+            extra_terms: whether to save terms of the model not needed for mean predictions, such as noise factors. Defaults to False.
         Returns:
             A dictionary containing the model's attributes.
         """
+        self.eval()
         dico = {}
         dico['kernel_type'] = self.covar_module.base_kernel.__class__.__name__ if self.outputscales is None else self.covar_module.__class__.__name__
         dico['noise_thresh'] = self.likelihood.noise_constraint.lower_bound.item()
-        Q, R, Q_orth = self.lmc_coefficients.QR()
-        if self.lmc_coefficients.mode == 'Q_plus':
-            dico['Q_orth'] = Q_orth.detach().tolist() 
-        dico['Q'] = Q.detach().tolist()
-        dico['R'] = R.detach().tolist()
-        dico['Sigma_proj'] = self.projected_noise().detach().tolist()
-        if self.diagonal_B:
-            dico['Sigma_orth'] = torch.exp(self.log_B_tilde.detach()).tolist()
+
+        if extra_terms:
+            dico['diagonal_B'] = self.diagonal_B
+            dico['scalar_B'] = self.scalar_B
+            dico['diagonal_R'] = self.diagonal_R
+            Q, R, Q_orth = self.lmc_coefficients.QR()
+            if self.lmc_coefficients.mode == 'Q_plus':
+                dico['Q_orth'] = Q_orth.detach().tolist() 
+            dico['Q'] = Q.detach().tolist()
+            dico['R'] = R.detach().tolist()
+            dico['Sigma_proj'] = self.projected_noise().detach().tolist()
+            if self.diagonal_B:
+                dico['Sigma_orth'] = torch.exp(self.log_B_tilde.detach()).tolist()
+            else:
+                dico['Sigma_orth'] = self.B_tilde_inv_chol.detach().tolist()
+            if hasattr(self, 'M'):
+                dico['M'] = self.M.detach().tolist()
         else:
-            dico['Sigma_orth'] = self.B_tilde_inv_chol.detach().tolist()
-        if hasattr(self, 'M'):
-            dico['M'] = self.M.detach().tolist()
+            dico['lmc_coeffs'] = self.lmc_coefficients().detach().tolist()
+
         with torch.no_grad():
             _ = self(torch.zeros_like(self.train_inputs[0])) # this is to compute the mean cache
         dico['mean_cache'] = self.prediction_strategy.mean_cache.tolist()

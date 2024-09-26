@@ -257,16 +257,10 @@ class MultitaskGPModel(ExactGPModel):
             loo_delta = torch.reshape(loo_delta.detach(), train_y.shape)
         return loo_var, loo_delta
     
-    def save( self):
+    def save( self, extra_terms=False):
+        self.eval()
         dico = {}
         dico['lmc_coeffs'] = self.lmc_coefficients().detach().tolist()
-        likelihood = self.likelihood
-        noises = likelihood.noise.detach() if hasattr(likelihood, 'noise') else 0.
-        if hasattr(likelihood, 'task_noises'):
-            noises = self.likelihood.task_noises.detach() + noises
-        elif hasattr(likelihood, 'task_noise_covar'):
-            dico['task_noise_covar'] = likelihood.task_noise_covar.detach().tolist()
-        dico['noises'] = noises.tolist()
         if self.outputscales:
             dico['outputscales'] = self.outputscale().tolist()
         dico['lscales'] = self.lscales().tolist()
@@ -278,6 +272,15 @@ class MultitaskGPModel(ExactGPModel):
             n_points, n_tasks = self.train_targets.shape
             res = gp_cache.reshape((n_points, n_tasks)).matmul(self.covar_module.task_covar_module.covar_matrix)
             dico['mean_cache'] = res.detach().tolist()
+
+        if extra_terms:
+            likelihood = self.likelihood
+            noises = likelihood.noise.detach() if hasattr(likelihood, 'noise') else 0.
+            if hasattr(likelihood, 'task_noises'):
+                noises = self.likelihood.task_noises.detach() + noises
+            elif hasattr(likelihood, 'task_noise_covar'):
+                dico['task_noise_covar'] = likelihood.task_noise_covar.detach().tolist()
+            dico['noises'] = noises.tolist()
         
         return dico
 

@@ -180,19 +180,24 @@ class LazyLMCModel(ExactGPModel):
             self.train_y = targets
 
 
-    def save( self) -> dict:
+    def save( self, extra_terms=False) -> dict:
         """
         Saves the model in a dictionary. The saved elements are strictly sufficient to make mean predictions (not variances).
         !! As of now, this method cannot accommodate : non-gaussian likelihoods and additional kernel settings !!
+        Args:
+            extra_terms: whether to save terms of the model not needed for mean predictions, such as noise factors. Defaults to False.
         Returns:
             A dictionary containing the model's attributes.
         """
+        self.eval()
         dico = {}
         dico['lmc_coeffs'] = self.lmc_coeffs.tolist()
-        dico['noise_val'] = self.noise_val
         with torch.no_grad():
             _ = self(torch.zeros_like(self.train_inputs[0])) # this is to compute the mean cache
         dico['mean_cache'] = self.prediction_strategy.mean_cache.tolist()
+        if extra_terms:
+            dico['noise_val'] = self.noise_val
+
         return dico
 
 

@@ -83,6 +83,7 @@ make_preds = True
 export_preds = False
 export_data_to_np = False
 save_torch_model = True
+store_model = True
 file_format = 'json' # 'json' or 'pickle'
 
 if __name__ == "__main__":
@@ -124,7 +125,7 @@ if __name__ == "__main__":
 
     ##--------------------------------------------------------------------------------
     ## Training setting
-    mod_to_run = 'plmc' # 'icm', 'plmc', 'vlmc', 'lazy_lmc', 'sogp'
+    mod_to_run = 'lazy_lmc' # 'icm', 'plmc', 'vlmc', 'lazy_lmc', 'sogp'
     stopp_crit = 'exp'
     sched = 'lin'
     lthreshes = {'max':1e-5, 'mean':1e-7, 'exp':1e-10}
@@ -201,19 +202,15 @@ if __name__ == "__main__":
 
     ## Model instantiation
     if mod_to_run == 'icm':
-        mod_kwargs = {k: str(v) for k, v in icm_kwargs.items()}
         model = MultitaskGPModel(X, Y, n_latents=n_lat, mean_type=mean_type, kernel_type=ker_type, **icm_kwargs)
 
     if mod_to_run == 'vlmc':
-        mod_kwargs = {k: str(v) for k, v in vlmc_kwargs.items()}
         model = VariationalMultitaskGPModel(X, train_y=Y, mean_type=mean_type, kernel_type=ker_type, 
                                             n_latents=n_lat, **vlmc_kwargs)
     if mod_to_run == 'plmc':
-        mod_kwargs = {k: str(v) for k, v in plmc_kwargs.items()}
         model = ProjectedGPModel(X, Y, n_lat, kernel_type=ker_type, **plmc_kwargs)
 
     if mod_to_run == 'lazy_lmc':
-        mod_kwargs = {k: str(v) for k, v in lazy_kwargs.items()}
         X, X_test = (X+1)/2, (X_test+1)/2 # The SplineKernel is only defined on [0;1]^d, while our data is normalized on [-1;1]^d
         model = LazyLMCModel(X, Y, n_lat, **lazy_kwargs)
 
@@ -260,12 +257,10 @@ if __name__ == "__main__":
                 print(key, cround(value, ndec=ndec))
 
     ##--------------------------------------------------------------------------------
-                
+    ##--------------------------------------------------------------------------------
     ## Saving model and results
     dico = {}
     if mod_to_run != 'sogp':
-        model_dico = model.save()
-        model_dico.update(mod_kwargs)
         dico['case'] = case
         dico['X'] = X.tolist()
         dico['y_means'] = means.tolist()
@@ -273,9 +268,7 @@ if __name__ == "__main__":
         dico['y_labels'] = xs_keys.tolist()
         dico['x_labels'] = ['Bu', 'Tf', 'Tm', 'Cb'] # Later, read from the data
         dico['x_bounds'] = var_ranges
-        dico['kernel_decomp'] = decomp
-        dico['kernel_type'] = ker_type.__name__
-        dico.update(model_dico)
+        dico.update(model.save())
 
         if save_torch_model:
             torch.save(model.state_dict(), exproot + 'model_{0}.pth'.format(mod_to_run))  #standard pytorch format
@@ -299,16 +292,17 @@ if __name__ == "__main__":
             run_info['pred_y'] = preds.tolist()
             run_info['pred_sigma'] = sigmas.tolist()
 
-    if file_format == 'pickle':
-        with open(exproot + '{0}_run_info.pkl'.format(case), 'wb') as f:
-            pickle.dump(run_info, f)
-        if dico:
-            with open(exproot + 'model_{0}.komi'.format(case), 'wb') as f:
-                pickle.dump(dico, f)
-    elif file_format == 'json':
-        with zipfile.ZipFile(exproot + '{0}.zip'.format(case), 'w', zipfile.ZIP_DEFLATED) as zf:
-            zf.writestr(exproot + 'gp_{0}_run_info.json'.format(case), json.dumps(run_info, indent = 3))
-        if dico:
+    if store_model:
+        if file_format == 'pickle':
+            with open(exproot + '{0}_run_info.pkl'.format(case), 'wb') as f:
+                pickle.dump(run_info, f)
+            if dico:
+                with open(exproot + 'model_{0}.komi'.format(case), 'wb') as f:
+                    pickle.dump(dico, f)
+        elif file_format == 'json':
             with zipfile.ZipFile(exproot + '{0}.zip'.format(case), 'w', zipfile.ZIP_DEFLATED) as zf:
-            # Écrire le dictionnaire au format JSON dans un fichier à l'interieur de l'archive
-                zf.writestr(exproot + 'gp_data_{0}.komi.json'.format(case), json.dumps(dico, indent = 3))
+                zf.writestr(exproot + 'gp_{0}_run_info.json'.format(case), json.dumps(run_info, indent = 3))
+            if dico:
+                with zipfile.ZipFile(exproot + '{0}.zip'.format(case), 'w', zipfile.ZIP_DEFLATED) as zf:
+                # Écrire le dictionnaire au format JSON dans un fichier à l'interieur de l'archive
+                    zf.writestr(exproot + 'gp_data_{0}.komi.json'.format(case), json.dumps(dico, indent = 3))

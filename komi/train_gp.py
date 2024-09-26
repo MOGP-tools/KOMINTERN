@@ -186,14 +186,15 @@ def predict(model, X_test, gpu=False, extra_context_managers={}, return_full_lik
     with ExitStack() as stack:
         for _, context in context_managers.items():
             stack.enter_context(context)
+        if hasattr(model, 'full_likelihood'):  # we have to compute the full likelihood of projected models
+            full_likelihood = model.full_likelihood()
+        else:
+            full_likelihood = model.likelihood
         if gpu:
             X_test = X_test.cuda()
             Y_test = Y_test.cuda()
             model = model.cuda()
-            if hasattr(model, 'full_likelihood'):  # we have to compute the full likelihood of projected models
-                full_likelihood = model.full_likelihood()
-            else:
-                full_likelihood = model.likelihood
+            full_likelihood = full_likelihood.cuda()
             free_mem = torch.cuda.mem_get_info()[0]
             num_bytes = X_test.element_size()
             n_points, n_tasks = model.train_targets.shape
@@ -216,6 +217,7 @@ def predict(model, X_test, gpu=False, extra_context_managers={}, return_full_lik
                 vars_pred = torch.cat(vars)
         else:
             model = model.cpu()
+            full_likelihood = full_likelihood.cpu()
             observed_pred = full_likelihood(model(X_test))
             pred_y = observed_pred.mean
             if context_managers.get('skip_pred_var', True) and isinstance(model, MultitaskGPModel):
@@ -240,16 +242,17 @@ def eval_model(model, X_test, Y_test, argus, met_dict, extra_context_managers={}
     pred_time = time.time() - start
 
     ## Computation of some noise terms
-    global_noise = full_likelihood.noise.squeeze() if hasattr(full_likelihood, 'noise') else 0.
-    n_tasks = Y_test.shape[1]
-    if hasattr(full_likelihood, 'task_noise_covar_factor'):
-        noise_mat_root = full_likelihood.task_noise_covar_factor.squeeze()
-        noise_mat = noise_mat_root.matmul(noise_mat_root.t()) + global_noise * torch.eye(n_tasks)
-        av_noise = torch.linalg.norm(torch.diag(noise_mat)) / n_tasks
-    elif hasattr(full_likelihood, 'task_noises'):
-        av_noise = torch.linalg.norm(full_likelihood.task_noises.squeeze() + global_noise)
-    else:
-        av_noise = global_noise
+    with torch.no_grad():
+        global_noise = full_likelihood.noise.squeeze() if hasattr(full_likelihood, 'noise') else 0.
+        n_tasks = Y_test.shape[1]
+        if hasattr(full_likelihood, 'task_noise_covar_factor'):
+            noise_mat_root = full_likelihood.task_noise_covar_factor.squeeze()
+            noise_mat = noise_mat_root.matmul(noise_mat_root.t()) + global_noise * torch.eye(n_tasks)
+            av_noise = torch.linalg.norm(torch.diag(noise_mat)) / n_tasks
+        elif hasattr(full_likelihood, 'task_noises'):
+            av_noise = torch.linalg.norm(full_likelihood.task_noises.squeeze() + global_noise)
+        else:
+            av_noise = global_noise
 
     metrics = {'pred_time': pred_time, 'noise': av_noise.cpu().numpy()}
     deltas = Y_test - pred_y

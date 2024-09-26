@@ -171,12 +171,12 @@ class VariationalMultitaskGPModel(gp.models.ApproximateGP):
             n_kernels = len(self.covar_module.kernels)
             ref_kernel = self.covar_module.kernels[0]
             attr_name = 'base_kernel.lengthscale.data' if hasattr(ref_kernel, 'base_kernel') else 'lengthscale.data'
-            scales = [reduce(getattr, attr_name.split('.'), ker) for ker in self.covar_module.kernels]
+            scales = [reduce(getattr, attr_name.split('.'), ker).squeeze() for ker in self.covar_module.kernels]
         else:
             n_kernels = 1
             ref_kernel = self.covar_module
             attr_name = 'base_kernel.lengthscale.data' if hasattr(ref_kernel, 'base_kernel') else 'lengthscale.data'
-            scales = reduce(getattr, attr_name.split('.'), self.covar_module)
+            scales = reduce(getattr, attr_name.split('.'), self.covar_module).squeeze()
 
         return [scales] if (n_kernels==1 and not unpacked) else scales
     
@@ -222,6 +222,8 @@ class VariationalMultitaskGPModel(gp.models.ApproximateGP):
         Saves the model in a dictionary. The saved elements are strictly sufficient to make mean predictions (not variances).
         !! As of now, this method cannot accommodate : non-gaussian likelihoods, variable outputscales, nontrivial kernel decompositions,
         priors on kernel hyperparameters, and additional kernel settings (the ker_kwargs argument of the model). !!
+        Args:
+            extra_terms: whether to save terms of the model not needed for mean predictions, such as noise factors. Defaults to False.
         Returns:
             A dictionary containing the model's attributes.
         """
