@@ -8,6 +8,46 @@ from gpytorch.kernels.kernel import Kernel
 from sklearn.utils.extmath import randomized_svd
 
 ##----------------------------------------------------------------------------------------------------------------------
+## Basics
+def tensor_iter( *iterators ):
+    if not iterators:
+        yield ()
+    else:
+        for first in iterators[0]:
+            for rest in tensor_iter(*iterators[1:]):
+                yield (first,) + rest
+
+## Library-independent metrics
+def i_mean(x, dim=None):
+    if isinstance(x, torch.Tensor):
+        return torch.mean(x, dim=dim)
+    else:
+        return np.mean(x, axis=dim)
+    
+def i_log(x):
+    if isinstance(x, torch.Tensor):
+        return torch.log(x)
+    else:
+        return np.log(x)
+    
+def i_sqrt(x):
+    if isinstance(x, torch.Tensor):
+        return torch.sqrt(x)
+    else:
+        return np.sqrt(x)
+def i_var(x, dim=None):
+    if isinstance(x, torch.Tensor):
+        return torch.var(x, dim=dim)
+    else:
+        return np.var(x, axis=dim)
+    
+def i_quantile(x, q):
+    if isinstance(x, torch.Tensor):
+        return torch.quantile(x, q)
+    else:
+        return np.quantile(x, q)
+
+##----------------------------------------------------------------------------------------------------------------------
 
 ## Custom means and kernels
 
@@ -74,7 +114,38 @@ class LinearMean(gp.means.mean.Mean):
         return torch.hstack([x, torch.ones((len(x), 1), device=x.device)])
 
 ##----------------------------------------------------------------------------------------------------------------------
-## utilitaries
+## Metrics and normalizations
+
+def compute_macro_errs(errs, concs, keys, cc_words_idx=(0,1)):
+    nonmacro_idx = [('macro' not in key) for key in keys]
+    n_keys, n_errs = keys[nonmacro_idx], errs[:,nonmacro_idx]
+    words = [key.split('_') for key in n_keys]
+    cc_keys = ['_'.join([w[idx] for idx in cc_words_idx]) for w in words]
+    concs_values = concs[cc_keys].values
+    if type(errs) is torch.Tensor:
+        concs_values = torch.as_tensor(concs_values, device=errs.device, dtype=errs.dtype)
+    res = n_errs * concs_values
+    return res
+
+
+def transfo_mesh( array, return_coeffs=False, value=None, reverse=False):
+    array = np.asarray(array)
+    a, b = array[0], array[-1]
+    if reverse:
+        m, p = (b-a)/2, (a+b)/2
+    else:
+        m, p = 2 / (b - a), (a + b) / (a - b)
+    if return_coeffs:
+        return m, p
+    if value is not None:
+        return m * value + p
+    else:
+        return m * array + p
+
+
+def max_norm_func( x: Tensor, axis: int = -1):
+    return torch.max(torch.abs(x), dim=axis).values
+
 
 class LeaveOneOutPseudoLikelihood(gp.mlls.exact_marginal_log_likelihood.ExactMarginalLogLikelihood):
     def __init__( self, likelihood, model, train_x, train_y):
@@ -96,6 +167,10 @@ class LeaveOneOutPseudoLikelihood(gp.mlls.exact_marginal_log_likelihood.ExactMar
         num_data = target.size(-1)
         return res.div_(num_data) - 0.5 * math.log(2 * math.pi)
 
+##----------------------------------------------------------------------------------------------------------------------
+    
+## Model definition and initialization
+    
 def handle_covar_( kernel: Kernel, dim: int, decomp: Union[List[List[int]], None]=None, n_funcs:int=1,
                    prior_scales:Union[Tensor,None]=None, prior_width:Union[Tensor,None]=None, outputscales:bool=True,
                    ker_kwargs:Union[dict, None]=None )-> Kernel:
@@ -188,23 +263,6 @@ def init_lmc_coefficients( train_y: Tensor, n_latents: int, QR_form:bool=False):
     else:
         y_transformed = U * S
     return y_transformed.T
-
-def transfo_mesh( array, return_coeffs=False, value=None, reverse=False):
-    array = np.asarray(array)
-    a, b = array[0], array[-1]
-    if reverse:
-        m, p = (b-a)/2, (a+b)/2
-    else:
-        m, p = 2 / (b - a), (a + b) / (a - b)
-    if return_coeffs:
-        return m, p
-    if value is not None:
-        return m * value + p
-    else:
-        return m * array + p
-    
-def max_norm_func( x: Tensor, axis: int = -1):
-    return torch.max(torch.abs(x), dim=axis).values
 ##----------------------------------------------------------------------------------------------------------------------
 
 ## Parametrizations

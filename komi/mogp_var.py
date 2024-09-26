@@ -12,9 +12,9 @@ from scipy.stats import qmc
 
 from .utilities import init_lmc_coefficients, handle_covar_
 
-class CustomLMCVariationalStrategy(gp.variational.LMCVariationalStrategy):  # allows to put means on tasks instead of latent processes
+class CustomLMCVariationalStrategy(gp.variational.LMCVariationalStrategy):
     """
-    This small overlay to the native LMCVariationalStrategy of gp allows to put deterministic means on tasks rather than latent processes.
+    This small overlay to the native LMCVariationalStrategy of gp allows to put deterministic mean functions on tasks rather than latent processes.
     """
     def __init__(self, mean_module:gp.means.mean, *args, **kwargs):
         """
@@ -43,34 +43,48 @@ class VariationalMultitaskGPModel(gp.models.ApproximateGP):
     """
     A standard variational LMC model using gp functionalities.
     """
-    def __init__( self, train_x:Tensor, n_latents:int, n_tasks:int, likelihood:Union[Likelihood,None]=None, 
-                 train_ind_ratio:float=1.5, seed:int=0,
-                  init_lmc_coeffs:bool=False, train_y:Union[Tensor,None]=None, prior_scales:Tensor=None, prior_width:Tensor=None,
-                  mean_type:Mean=gp.means.ConstantMean, kernel_type:Kernel=gp.kernels.RBFKernel,
-                  outputscales:bool=False, 
-                  decomp:Union[List[List[int]],None]=None,
-                  distrib:gp.variational._VariationalDistribution=gp.variational.CholeskyVariationalDistribution, 
-                  var_strat:gp.variational._VariationalStrategy=gp.variational.VariationalStrategy,
-                  noise_thresh:float=1e-4,
-                  ker_kwargs:Union[dict,None]=None, 
-                  **kwargs):
+    def __init__( self,
+                 train_x:Tensor,
+                 n_latents:int,
+                 n_tasks:Union[int,None]=None,
+                 train_y:Union[Tensor,None]=None,
+                 train_ind_ratio:float=1.5,
+                 likelihood:Union[Likelihood,None]=None, 
+                 kernel_type:Kernel=gp.kernels.RBFKernel,
+                 mean_type:Mean=gp.means.ConstantMean,
+                 decomp:Union[List[List[int]],None]=None,
+                 distrib:gp.variational._VariationalDistribution=gp.variational.CholeskyVariationalDistribution, 
+                 var_strat:gp.variational._VariationalStrategy=gp.variational.VariationalStrategy,
+                 init_lmc_coeffs:bool=True,
+                 noise_thresh:float=1e-4,
+                 outputscales:bool=False, 
+                 prior_scales:Tensor=None,
+                 prior_width:Tensor=None,
+                 ker_kwargs:Union[dict,None]=None, 
+                 seed:int=0,
+                 **kwargs):
         """
         Args:
             train_x: training input data
             n_latents: number of latent processes
-            n_tasks: number of output tasks
+            n_tasks: number of output tasks. It must provided when train_y is not None in order to dimension the model. Defaults to None.
+            train_y: training data labels, used only for the SVD initialization of LMC coefficients ; with this model, data labels are only used 
+            during loss computation, not predictions. It doesn't need to be provided if this initialization is not used. Defaults to None.
             train_ind_ratio: ratio between the number of training points and this of inducing points. Defaults to 1.5.
-            seed: Random seed for inducing points generation. Defaults to 0.
-            init_lmc_coeffs: Whether to initialize LMC coefficients with the SVD of the training labels. Defaults to False.
-            train_y: training data labels, used only for the SVD initialization of LMC coefficients. Defaults to None.
+            likelihood: gpytorch likelihood function for the outputs. If none is provided, a default MultitaskGaussianLikelihood is used. Defaults to None.
+            kernel_type: gpytorch kernel function for the latent processes. Defaults to gp.kernels.RBFKernel.
+            mean_type: gpytorch mean function for the outputs. Defaults to gp.means.ConstantMean.
+            decomp: instructions to create a composite kernel with subgroups of variables. Ex : decomp = [[0,1],[1,2]] --> k(x0,x1,x2) = k1(x0,x1) + k2(x1,x2). Defaults to None.
+            distrib: gpytorch variational distribution for inducing values (see gpytorch documentation). Defaults to gp.variational.CholeskyVariationalDistribution.
+            var_strat: gpytorch variational strategy (see gpytorch documentation). Defaults to gp.variational.VariationalStrategy.
+            init_lmc_coeffs: whether to initialize LMC coefficients with SVD of the training labels. If False, these coefficients are sampled from a normal distribution. Defaults to True.
+            noise_thresh: minimum value for the noise parameter. Has a large impact for ill-conditioned kernel matrices, which is the case of the HXS application. Defaults to 1e-6.
+            outputscales: whether to endow each latent kernel with a learned scaling factor, k(.) = a*k_base(.). This is only useful for predictive variance 
+            scaling, and may result in over-parametrization. Defaults to False
             prior_scales: Prior mean for characteristic lengthscales of the kernel. Defaults to None.
             prior_width: Prior deviation-to-mean ratio for characteristic lengthscales of the kernel. Defaults to None.
-            mean_type: gp mean function for the outputs. Defaults to gp.means.ConstantMean.
-            kernel_type: . gp kernel function for latent processes. Defaults to gp.kernels.RBFKernel.
-            decomp: instructions to create a composite kernel with subgroups of variables. Ex : decomp = [[0,1],[1,2]] --> k(x0,x1,x2) = k1(x0,x1) + k2(x1,x2). Defaults to None.
-            distrib: gp variational distribution for inducing values (see gp documentation). Defaults to gp.variational.CholeskyVariationalDistribution.
-            var_strat: gp variational strategy (see gp documentation). Defaults to gp.variational.VariationalStrategy.
             ker_kwargs: Additional arguments to pass to the gp kernel function. Defaults to None.
+            seed: Random seed for inducing points generation. Defaults to 0.
         """
 
         if ker_kwargs is None:
@@ -121,14 +135,24 @@ class VariationalMultitaskGPModel(gp.models.ApproximateGP):
         self.n_tasks, self.n_latents, self.decomp = n_tasks, n_latents, decomp
         self.outputscales = outputscales
 
-        if init_lmc_coeffs and train_y is not None:
-            lmc_coefficients = init_lmc_coefficients(train_y, n_latents=n_latents)
-            if train_y.device.type=='cuda':
-                lmc_coefficients = lmc_coefficients.cuda()
-            # this parameter has already been initialized with random values at the instantiation of the variational strategy, so registering it anew is facultative
-            self.variational_strategy.register_parameter("lmc_coefficients", torch.nn.Parameter(lmc_coefficients))  #shape n_latents x n_tasks
+        if init_lmc_coeffs :
+            if train_y is None :
+                warnings.warn('No training labels provided. LMC coefficients will be initialized randomly.')
+                # no need to register the parameter here, as it is already done in the variational strategy
+            else :
+                lmc_coefficients = init_lmc_coefficients(train_y, n_latents=n_latents)
+                if train_y.device.type=='cuda':
+                    lmc_coefficients = lmc_coefficients.cuda()
+                self.variational_strategy.register_parameter("lmc_coefficients", torch.nn.Parameter(lmc_coefficients))  #shape n_latents x n_tasks
 
     def forward( self, x:Tensor )-> Tensor:
+        """
+        Computes the prior distribution of the latent processes at the input locations. ! This does not return task-level values !
+        Args:
+            x: input data tensor
+        Returns:
+            A batched gp multivariate normal distribution representing latent processes values, which mean has shape n_latents x n_points.
+        """
         mean_x = self.mean_module(x)
         covar_x = self.covar_module(x)
         return gp.distributions.MultivariateNormal(mean_x, covar_x)
@@ -174,14 +198,37 @@ class VariationalMultitaskGPModel(gp.models.ApproximateGP):
             res[:, 0] = self.covar_module.outputscale.data.squeeze()
         return res.squeeze() if (n_kernels==1 and unpacked) else res
     
-    def lmc_coefficients( self ):
+    def lmc_coefficients( self ) -> Tensor:
+        """
+        Returns the mixing matrix of the LMC model, which is a tensor of shape n_latents x n_tasks.
+        Returns:
+            A tensor of shape n_latents x n_tasks.
+        """
         return self.variational_strategy.lmc_coefficients.data
     
     def compute_latent_distrib( self, x, prior=False, **kwargs):
+        """
+        Outputs (distributional) posterior values of the latent processes at the input locations.
+        Args:
+            x: input data tensor
+
+        Returns:
+            A batched gp multivariate normal distribution representing latent processes values, which mean has shape n_latents x n_points.
+        """
         return self.base_variational_strategy(x, prior=prior, **kwargs)
     
-    def save( self):
+    def save( self) -> dict:
+        """
+        Saves the model in a dictionary. The saved elements are strictly sufficient to make mean predictions (not variances).
+        !! As of now, this method cannot accommodate : non-gaussian likelihoods, variable outputscales, nontrivial kernel decompositions,
+        priors on kernel hyperparameters, and additional kernel settings (the ker_kwargs argument of the model). !!
+        Returns:
+            A dictionary containing the model's attributes.
+        """
         dico = {}
+        dico['kernel_type'] = self.covar_module.base_kernel.__class__.__name__ if self.outputscales is None else self.covar_module.__class__.__name__
+        dico['mean_type'] = self.mean_module.__class__.__name__
+        dico['noise_thresh'] = self.likelihood.noise_constraint.lower_bound.item()
         likelihood = self.likelihood
         dico['lmc_coeffs'] = self.lmc_coefficients().detach().tolist()
         noises = likelihood.noise.detach() if hasattr(likelihood, 'noise') else 0.

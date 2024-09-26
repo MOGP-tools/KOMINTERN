@@ -20,7 +20,8 @@ torch.backends.cuda.matmul.allow_tf32 = False
 torch.set_default_dtype(torch.float64)
 import gpytorch as gp
 
-from komi.utilities import transfo_mesh, SplineKernel, LinearMean, PolynomialMean, max_norm_func
+from komi.utilities import transfo_mesh, SplineKernel, LinearMean, PolynomialMean, max_norm_func, compute_macro_errs, \
+i_mean, i_log, i_sqrt, i_var, i_quantile
 from komi.base_gp import ExactGPModel
 from komi.mogp_lazy import LazyLMCModel
 from komi.mogp_var import VariationalMultitaskGPModel
@@ -37,20 +38,42 @@ def cround(n, ndec=2):
         d = np.ceil(-np.log10(abs(n))).astype(int)
         return np.round(n, d + ndec)
 
+def process_data(xs, var_ranges, variables, xs_keys=None, cc=None, filter_thresh=None):
+    if filter_thresh is not None:
+        filt = (np.abs(xs).mean(axis=0) > 1e-5) #elimintation of almost-zero HXS
+        xs = xs.loc[:, filt]
+    mask = (xs['tf'] >= xs['tm'])&(xs['bu']>min_bu)&(xs['bu']<max_bu)
+    xs = xs[mask]
+    if cc is not None:
+        cc = cc[mask]
+    if xs_keys is None:
+        xs_keys = xs.columns.difference(all_vars)
+    Y = xs[xs_keys]
+    xs.loc[:,'root_bu'] = np.sqrt(xs['bu'].values)
+    X = xs[variables].copy()
+    for var in variables:
+        X[var+'_n'] = transfo_mesh(var_ranges[var], value=X[var])
+    X = X[vars_n]
+    X = torch.tensor(X.values, dtype = torch.get_default_dtype())
+    Y = torch.tensor(Y.values, dtype = torch.get_default_dtype())
+    return X, Y, xs_keys, cc 
+    
 met_dict = {
-    'alpha_CI': lambda rwm : torch.mean((rwm['errs'] < 2 * rwm['sigmas']).float()),
-    'PVA': lambda rwm : torch.log(torch.mean(rwm['errs2'] / rwm['vars'], dim=0)).mean(),
-    'R2': lambda rwm : (1 - torch.mean(rwm['errs2'], dim=0) / torch.var(rwm['y_test'], dim=0)).mean(),
-    'RMSE': lambda rwm : torch.sqrt(rwm['errs2'].mean()),
+    'alpha_CI': lambda rwm : i_mean((rwm['errs'] < 2 * rwm['sigmas']).float()),
+    'PVA': lambda rwm : i_log(i_mean(rwm['errs2'] / rwm['vars'], dim=0)).mean(),
+    'R2': lambda rwm : (1 - i_mean(rwm['errs2'], dim=0) / i_var(rwm['y_test'], dim=0)).mean(),
+    'RMSE': lambda rwm : i_sqrt(rwm['errs2'].mean()),
     'mean_err_abs': lambda rwm : rwm['errs'].mean(),
     'max_err_abs': lambda rwm : rwm['errs'].max(),
-    # 'mean_err_rel': lambda rwm : (rwm['errs'] / torch.std(rwm['y_test'], dim=0)).mean(),
-    # 'max_err_rel': lambda rwm : (rwm['errs'] / torch.std(rwm['y_test'], dim=0)).max(),
-    'mean_err_quant05': lambda rwm : torch.quantile(rwm['errs'], 0.05),
-    'mean_err_quant95': lambda rwm : torch.quantile(rwm['errs'], 0.95),
-    'mean_err_quant99': lambda rwm : torch.quantile(rwm['errs'], 0.99),
+    'mean_err_quant05': lambda rwm : i_quantile(rwm['errs'], 0.05),
+    'mean_err_quant95': lambda rwm : i_quantile(rwm['errs'], 0.95),
+    'mean_err_quant99': lambda rwm : i_quantile(rwm['errs'], 0.99),
+    'mean_err_macro': lambda rwm : compute_macro_errs(rwm['u_errs'], rwm['concs'], rwm['keys']).mean(),
+    'max_err_macro': lambda rwm : compute_macro_errs(rwm['u_errs'], rwm['concs'], rwm['keys']).max(),
 }
+##--------------------------------------------------------------------------------
 
+## Experiment settings
 print_metrics=True  # if True, performance metrics are printed at each run (dosen't affect exported results)
 print_loss=True # if True, loss is printed after freq_print iteration (dosen't affect exported results)
 freq_print=1000 # to further customize experiment name
@@ -64,48 +87,33 @@ file_format = 'json' # 'json' or 'pickle'
 
 if __name__ == "__main__":
 
-    ## Data preparation
-    root = '../useCase/neutro_data/'
-
+    ## Data features
     variables = ['root_bu', 'tf', 'tm', 'br']
     vars_n = [var + '_n' for var in variables] #normalized variables
     all_vars = variables + vars_n + ['bu']
     var_ranges = {'bu':[0, 62000], 'tf':[373.15, 2073.15], 'tm':[373.15, 600], 'br':[0, 2500]} # Later, read from the data
     var_ranges['root_bu'] = np.sqrt(var_ranges['bu']).tolist()
-
-    train_df = pd.read_csv(root + 'b0py26e_grp02_ENE_FA_L_chain_downsampled_xs.csv', index_col=0)
-    test_df = pd.read_csv(root + 'b0py26e_grp02_ENE_FA_L_chain_LHS_PIJ_512_xs.csv', index_col=0)
-
-    filt = (np.abs(train_df).mean(axis=0) > 1e-5) #elimintation of almost-zero HXS
-    train_df = train_df.loc[:, filt]
     min_bu, max_bu = 75., 51000.
-    mask = (train_df['bu']>min_bu) & (train_df['bu']<max_bu) & (train_df['tf']>train_df['tm']) #elimination of points with bu outside the range
-    train_df = train_df[mask]
-    mask = (test_df['bu']>min_bu) & (test_df['bu']<max_bu) & (test_df['tf']>test_df['tm'])
-    test_df = test_df[mask]
-    xs_keys = train_df.columns.difference(all_vars) #just HXS, no variables
- 
+
+    ## Data loading
+    root = '../useCase/neutro_data/'
+    case = 'b0py26e_grp02_ENE_FA_L_chain'  # enter the name of the run here
+    train_df = pd.read_csv(root + case + '_' + 'downsampled_xs.csv', index_col=0)
+    train_cc = pd.read_csv(root + case + '_' + 'downsampled_cc.csv', index_col=0)
+    test_df = pd.read_csv(root + case + '_' + 'LHS_PIJ_512_xs.csv', index_col=0)
+    test_cc = pd.read_csv(root + case + '_' + 'LHS_PIJ_512_cc.csv', index_col=0)
+
+    ## Preprocessing and normalization
+    X, Y, xs_keys, train_cc = process_data(train_df, var_ranges, variables, cc=train_cc, filter_thresh=1e-5)
+    X_test, Y_test, __ , test_cc = process_data(test_df, var_ranges, variables, cc=test_cc, xs_keys=xs_keys)
+    # X, X_test, Y, Y_test = X[::2], X_test[::2], Y[::2, :15], Y_test[::2, :15]
+    n_points, n_tasks = Y.shape
     norm_func = torch.std
-    # norm_func = max_norm_func
-    Y = torch.as_tensor(train_df[xs_keys].values)
-    Y_test = torch.as_tensor(test_df[xs_keys].values)
     means, devs = Y.mean(dim=0), norm_func(Y, dim=0)
     Y = (Y - means) / devs
     Y_test = (Y_test - means) / devs
 
-    train_df['root_bu'] = np.sqrt(train_df['bu'].values)
-    test_df['root_bu'] = np.sqrt(test_df['bu'].values)
-    train_x = train_df[variables].copy()
-    test_x = test_df[variables].copy()
-    for var in variables:
-        train_x[var + '_n'] = transfo_mesh(var_ranges[var], value=train_x[var])
-        test_x[var + '_n'] = transfo_mesh(var_ranges[var], value=test_x[var])
-    X = torch.as_tensor(train_x[vars_n].values)
-    X_test = torch.as_tensor(test_x[vars_n].values)
-
-    # X, X_test, Y, Y_test = X[::2], X_test[::2], Y[::2, :15], Y_test[::2, :15]
-    n_points, n_tasks = Y.shape
-    case = 'b0py26e_02g_FA'  # enter the name of the run here
+    ## Eventually export data
     exproot = '../results/'
     if export_data_to_np:
         np.save(exproot + 'train_x_sobol256_full.npy', X.numpy())
@@ -116,7 +124,7 @@ if __name__ == "__main__":
 
     ##--------------------------------------------------------------------------------
     ## Training setting
-    mod_to_run = 'vlmc'
+    mod_to_run = 'plmc' # 'icm', 'plmc', 'vlmc', 'lazy_lmc', 'sogp'
     stopp_crit = 'exp'
     sched = 'lin'
     lthreshes = {'max':1e-5, 'mean':1e-7, 'exp':1e-10}
@@ -125,7 +133,7 @@ if __name__ == "__main__":
         'gpu':False,
         'lr_max':1e-2,
         'lr_min':2e-3,
-        'n_iter':50000,
+        'n_iter':1000,
         'stopp_crit':stopp_crit,
         'loss_thresh':lthreshes[stopp_crit],
         'patience':patiences[stopp_crit], 
@@ -140,9 +148,10 @@ if __name__ == "__main__":
         train_args['lambda_lr'] = lambda i : i/last_epoch*lr_min/lr_max + (last_epoch-i)/last_epoch if i <= last_epoch else lr_min/lr_max
 
     ##--------------------------------------------------------------------------------
+        
     ## Modeling options
     ker_type = gp.kernels.RBFKernel # gp.kernels.PiecewisePolynomialKernel
-    mean_type = gp.means.ZeroMean
+    mean_type = gp.means.ZeroMean # Do not change except good reason !
     lik_rank = 0
     n_lat = 12
     noise_bound = 1e-4
@@ -188,16 +197,23 @@ if __name__ == "__main__":
                  'train_x':X,
                 }           
 
+    ##--------------------------------------------------------------------------------
+
+    ## Model instantiation
     if mod_to_run == 'icm':
+        mod_kwargs = {k: str(v) for k, v in icm_kwargs.items()}
         model = MultitaskGPModel(X, Y, n_latents=n_lat, mean_type=mean_type, kernel_type=ker_type, **icm_kwargs)
 
     if mod_to_run == 'vlmc':
-        model = VariationalMultitaskGPModel(X, train_y=Y, n_tasks=n_tasks, mean_type=mean_type, kernel_type=ker_type, 
+        mod_kwargs = {k: str(v) for k, v in vlmc_kwargs.items()}
+        model = VariationalMultitaskGPModel(X, train_y=Y, mean_type=mean_type, kernel_type=ker_type, 
                                             n_latents=n_lat, **vlmc_kwargs)
     if mod_to_run == 'plmc':
+        mod_kwargs = {k: str(v) for k, v in plmc_kwargs.items()}
         model = ProjectedGPModel(X, Y, n_lat, kernel_type=ker_type, **plmc_kwargs)
 
     if mod_to_run == 'lazy_lmc':
+        mod_kwargs = {k: str(v) for k, v in lazy_kwargs.items()}
         X, X_test = (X+1)/2, (X_test+1)/2 # The SplineKernel is only defined on [0;1]^d, while our data is normalized on [-1;1]^d
         model = LazyLMCModel(X, Y, n_lat, **lazy_kwargs)
 
@@ -211,13 +227,17 @@ if __name__ == "__main__":
             args_spec['train_y'] = Y[:, i]#.unsqueeze(-1)
             mod_list[i] = (ExactGPModel, args_spec, {})
 
+    ##--------------------------------------------------------------------------------
+            
     ## Training
     if mod_to_run == 'lazy_lmc': # no need to train this model
-        train_metrics = eval_loo(model, Y, met_dict=met_dict)
+        train_metrics = eval_loo(model, Y, met_dict=met_dict, concs=train_cc, keys=xs_keys, devs=devs)
     elif mod_to_run == 'sogp':
-        mod_list, train_metrics = train_parallel(mod_list, X, Y, train_args, max_workers=max_workers, compute_loo=True, met_dict=met_dict)
+        mod_list, train_metrics = train_parallel(mod_list, X, Y, train_args, max_workers=max_workers, compute_loo=True,
+                                                 met_dict=met_dict, concs=train_cc, keys=xs_keys, devs=devs)
     else:
-        model, train_metrics = train_model(model, X, Y, train_args, compute_loo=(mod_to_run!='vlmc'), met_dict=met_dict)
+        model, train_metrics = train_model(model, X, Y, train_args, compute_loo=(mod_to_run!='vlmc'),
+                                           concs=train_cc, keys=xs_keys, met_dict=met_dict, devs=devs)
     if print_metrics:
         print('\n Training statistics \n')
         for key, value in train_metrics.items():
@@ -230,19 +250,22 @@ if __name__ == "__main__":
         test_args = {'gpu':False}
         if mod_to_run == 'sogp':
             preds, sigmas, pred_metrics = eval_parallel(mod_list, X_test, Y_test, argus=test_args, max_workers=max_workers, 
-                                                         extra_context_managers=extra_context, met_dict=met_dict)
+                                                         extra_context_managers=extra_context, met_dict=met_dict, devs=devs)
         else:
-            preds, sigmas, pred_metrics = eval_model(model, X_test, Y_test, argus=test_args,
-                                                     extra_context_managers=extra_context, met_dict=met_dict)
+            preds, sigmas, pred_metrics = eval_model(model, X_test, Y_test, argus=test_args, extra_context_managers=extra_context, 
+                                                     met_dict=met_dict, concs=test_cc, keys=xs_keys, devs=devs)
         if print_metrics:
             print('\n Prediction metrics \n ')
             for key, value in pred_metrics.items():
                 print(key, cround(value, ndec=ndec))
 
+    ##--------------------------------------------------------------------------------
+                
     ## Saving model and results
     dico = {}
     if mod_to_run != 'sogp':
         model_dico = model.save()
+        model_dico.update(mod_kwargs)
         dico['case'] = case
         dico['X'] = X.tolist()
         dico['y_means'] = means.tolist()

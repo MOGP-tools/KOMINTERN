@@ -5,6 +5,9 @@ import pandas as pd
 from scipy.stats import qmc
 from scipy.spatial.distance import cdist
 
+from komi.mogp_plmc import ProjectedGPModel
+from komi.mogp_lazy import LazyLMCModel
+
 ## Utilitaires
 def get_closest_el(l, elem):
     # on suppose que la liste est triée et qu'on sera toujours au-dessus du plus petit élément
@@ -35,6 +38,8 @@ class ActiveSampler:
         self.current_data = current_data
         self.current_X = current_X
         self.visited_points = []
+        if self.strategy in ["Tdownsampling","Ldownsampling"]:
+            self.old_indices = np.arange(len(self.current_X))
 
     def gen_candidate_set(self, n_points, dim, algo='sobol', seed=0, return_set=False):
         if algo == 'sobol':
@@ -48,29 +53,35 @@ class ActiveSampler:
             set = 2*np.random.rand(n_points, dim) - 1
         else:
             raise NotImplementedError
+        self.X_candidates = torch.tensor(set).to(torch.get_default_dtype())
+        self.old_indices = np.arange(len(self.X_candidates))
         if return_set:
             return set
-        self.X_candidates = torch.tensor(set).to(torch.get_default_dtype())
         
-    def add_data(self, X, Y, normalize=True, norm_func=torch.std):
+    def add_data(self, X, Y, normalize=False, norm_func=torch.std):
         self.current_X = torch.cat([self.current_X, X])
         new_Y = torch.cat([self.current_data, Y])
         if normalize:
             new_Y = (new_Y - new_Y.mean(dim=0))/norm_func(new_Y, dim=0)
         self.current_data = new_Y
 
-    def modify_train_set(self, new_X=None, new_Y=None, **kwargs):
+    def modify_train_set(self, new_X=None, new_Y=None, normalize=False, norm_func=torch.std):
+        if new_X is not None and new_Y is not None:
+            self.add_data(new_X, new_Y)
         train_x, train_y = self.current_X, self.current_data
-        if self.strategy in ["downsampling","ldownsampling"]:
+        if self.strategy in ["Tdownsampling","Ldownsampling"]:
             mask = np.array([point not in self.visited_points for point in np.arange(len(train_x))]).astype(bool)
             train_x, train_y, self.old_indices = train_x[mask], train_y[mask], np.arange(len(train_x))[mask]
         else:
             mask = np.array([point not in self.visited_points for point in np.arange(len(self.X_candidates))]).astype(bool)
-            X_candidates = self.X_candidates[mask]
+            self.X_candidates = self.X_candidates[mask]
             self.old_indices = np.arange(len(self.X_candidates))[mask]
 
+        if normalize:
+            train_y = (train_y - train_y.mean(dim=0))/norm_func(train_y, dim=0)
+            
         self.model.set_train_data(train_x, train_y, strict=False)
-        self.model.register_buffer('train_y', train_y)
+
         # if self.strategy!='downsampling':
         #     new_x, new_y = train_x[-self.n_samples:], train_y[-self.n_samples:]
         #     if self.n_samples==1:
@@ -98,16 +109,15 @@ class ActiveSampler:
             return scores
 
     def find_next_points(self, n_samples, output_train=None, only_idx=False, verbose=True, **kwargs):
-        if self.strategy in ['Lloo', 'Tloo', 'Ldownsampling, Tdownsampling']:
+        if self.strategy in ['Lloo', 'Tloo', 'Ldownsampling', 'Tdownsampling']:
             var_loo, delta_loo = self.model.compute_loo(output_train, latent=(self.strategy in ['Lloo', 'Ldownsampling']))
             if self.strategy in ['Lloo', 'Tloo']:
                 eloo2 = delta_loo**2
             else:
                 eloo = torch.abs(delta_loo)
 
-        lscales_mat = self.model.lscales()
         # assumes no kernel decomposition. Otherwise, need to modify this (with some heuristic aggregation of lengthscales)
-        if self.strategy in ["downsampling","ldownsampling"]:
+        if self.strategy in ["Ldownsampling","Tdownsampling"]:
             scores = self.aggr_func(eloo, dim=1)
         else:
             if self.strategy in ['Tloo', 'Lloo', 'Lvar']:
@@ -122,20 +132,22 @@ class ActiveSampler:
             if self.strategy in ['Tvar', 'Lvar']:
                 scores = self.aggr_func(var_values, dim=1)
             else:
+                lscales_mat = self.model.lscales()
                 lmc_coeffs = self.model.lmc_coefficients() if self.strategy=='Tloo' else None
                 scores = self.compute_scores(var_values, lscales_mat, eloo2, var_loo, lmc_coeffs)
 
         if self.strategy in ["Ldownsampling","Tdownsampling"]:
             top_values, top_ind_red = torch.topk(torch.as_tensor(scores), n_samples, largest=False)
             top_ind = self.old_indices[top_ind_red]
-            new_points = top_ind if only_idx else self.current_X.values[top_ind]
+            new_points = top_ind if only_idx else self.current_X[top_ind]
         else:
             self.metrics['score'] = scores.max().cpu().numpy()
             top_values, top_ind_red = torch.topk(torch.as_tensor(scores), n_samples)
             top_ind = self.old_indices[top_ind_red]
             new_points = top_ind if only_idx else self.X_candidates[top_ind].numpy()
         if verbose:
-            print('Score at current iteration :', top_values[0].cpu().numpy())
+            best_score = top_values[0].cpu().numpy()
+            print('Score at current iteration :', best_score)
 
         if n_samples==1:
             new_points = np.expand_dims(new_points,0) if not only_idx else new_points
@@ -144,7 +156,7 @@ class ActiveSampler:
             for ind in top_ind:
                 self.visited_points.append(ind.item())
 
-        return new_points
+        return new_points, best_score
 
 
         

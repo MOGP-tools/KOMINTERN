@@ -1,5 +1,5 @@
 from functools import reduce #, lru_cache
-from typing import Union, List
+from typing import Union, List, Tuple
 import warnings
 import numpy as np
 import torch
@@ -9,7 +9,6 @@ from gpytorch.means.mean import Mean
 from gpytorch.likelihoods.likelihood import Likelihood
 from linear_operator.operators import KroneckerProductLinearOperator, RootLinearOperator
 from linear_operator.operators.dense_linear_operator import to_linear_operator
-from sklearn.utils.extmath import randomized_svd
 
 from .utilities import init_lmc_coefficients, ScalarParam, PositiveDiagonalParam, LowerTriangularParam, UpperTriangularParam
 from .base_gp import ExactGPModel
@@ -25,13 +24,19 @@ class LMCMixingMatrix(torch.nn.Module):
         """
 
         Args:
-            Q_plus: (augmented) orthonormal part of the mixing matrix. See the reference article for explanations
-            R: upper triangular part of the mixing matrix. See the reference article for explanations
+            Q_plus: (augmented) orthonormal part of the mixing matrix, of shape n_tasks x n_latents or n_tasks x n_tasks
+            R: upper triangular part of the mixing matrix, of shape n_latents x n_latents
+            bulk: whether to parametrize the mixing matrix as a unique n_tasks x n_latents (or n_tasks x n_tasks) matrix with no
+            specific property, or as a product of its Q and R factors. The first option is only possible if no constraint is put on these factors.
+            It is generally faster and more stable, but can be less so in the "augmented" case (general PLMC) where a n_tasks x n_tasks matrix must be parametrized.
+            Defaults to True.
         """
         super().__init__()
         if Q_plus.shape[1]==Q_plus.shape[0]:
+            ## If the inputed Q matrix is of shape n_tasks x n_tasks, we assume that it is the augmented Q_plus matrix
             self.mode = 'Q_plus'
         elif Q_plus.shape[1]==R.shape[0]:
+            ## If the inputed Q matrix is of shape n_tasks x n_latents, we assume that it is the regular Q matrix (Q factor of the QR decomposition of the mixing matrix)
             self.mode = 'Q'
         else:
             raise ValueError('Wrong dimensions for Q_plus : should be n_tasks x n_tasks or n_tasks x n_latents')
@@ -52,16 +57,33 @@ class LMCMixingMatrix(torch.nn.Module):
             self.register_parameter("Q_plus", torch.nn.Parameter(Q_plus, requires_grad=True))
             self.register_parameter("R", torch.nn.Parameter(R, requires_grad=True))
 
-    def Q( self ):
+    def Q( self ) -> Tensor:
+        """
+        Outputs the Q factor of the QR decomposition of the mixing matrix.
+        Returns:
+            Q factor of the mixing matrix, of shape n_tasks x n_latents.
+        """
         if self.mode=='Q_plus':
             return self.Q_plus[:, :self.n_latents]
         else:
             return self.Q_plus
 
-    def Q_orth( self ):
+    def Q_orth( self ) -> Tensor:
+        """
+        Outputs the orthonormal complement of the Q factor of the QR decomposition of the mixing matrix.
+        Returns:
+            Orthonormal complement of Q, of shape n_tasks x (n_tasks - n_latents).
+        """
         return self.Q_plus[:, self.n_latents:]
 
-    def QR(self):
+    def QR(self) -> Tuple[Tensor, Tensor, Union[Tensor,None]]:
+        """
+        Outputs the Q and R factors of the mixing matrix, and the orthonormal complement Q_orth of Q.
+        Returns:
+            Q factor of the mixing matrix, of shape n_tasks x n_latents.
+            R factor of the mixing matrix, of shape n_latents x n_latents.
+            Orthonormal complement of Q, of shape n_tasks x (n_tasks - n_latents) or None if self.model == 'Q_plus' (general PLMC model).
+        """
         if self.bulk:
             Q_plus, R_padded = torch.linalg.qr(self.H)
             if self.mode=='Q_plus':
@@ -74,7 +96,12 @@ class LMCMixingMatrix(torch.nn.Module):
             Q, Q_orth, R = self.Q(), self.Q_orth(), self.R
         return Q, R, Q_orth
 
-    def forward( self ):
+    def forward( self ) -> Tensor:
+        """
+        Outputs the full mixing matrix H, in transposed form in order to match the standard storage format of data labels.
+        Returns:
+            Transposed mixing matrix H, of shape n_tasks x n_latents.
+        """
         if self.bulk:
             if self.mode == 'Q':
                 return self.H.T
@@ -83,7 +110,7 @@ class LMCMixingMatrix(torch.nn.Module):
         else:
             return (self.Q() @ self.R).T #format : n_latents x n_tasks
 
-    def size( self, int=None ):
+    def size( self, int=None ) -> Union[int, torch.Size]:
         if int:
             return self._size[int]
         else:
@@ -92,27 +119,52 @@ class LMCMixingMatrix(torch.nn.Module):
 
 class ProjectedGPModel(ExactGPModel):
     """
-    The projected LMC from the reference article.
+    The projected LMC model. Reference : https://arxiv.org/abs/2310.12032
     """
-    def __init__( self, train_x:Tensor, train_y:Tensor, n_latents:int, proj_likelihood:Union[None,Likelihood]=None, 
-                  init_lmc_coeffs:bool=False, BDN:bool=True, diagonal_B:bool=False, scalar_B:bool=False, diagonal_R:bool=False,
-                  mean_type:Mean=gp.means.ZeroMean, ortho_param='matrix_exp', bulk=True,
-                  noise_thresh:float=1e-4, noise_init:float=1e-2, outputscales:bool=False,
-                  jitter_val:Union[float,None]=None, **kwargs):
-        """Initialization of the model. Note that the optional arguments of the ExactGPModel also apply here thanks to the inheritance.
+    def __init__( self,
+                  train_x:Tensor,
+                  train_y:Tensor,
+                  n_latents:int,
+                  proj_likelihood:Union[None,Likelihood]=None, 
+                  init_lmc_coeffs:bool=True,
+                  BDN:bool=True,
+                  diagonal_B:bool=False,
+                  scalar_B:bool=False,
+                  diagonal_R:bool=False,
+                  bulk=True,
+                  ortho_param='matrix_exp',
+                  mean_type:Mean=gp.means.ZeroMean,
+                  noise_thresh:float=1e-4,
+                  outputscales:bool=False,
+                  jitter_val:Union[float,None]=None,
+                  **kwargs):
+        """Initialization of the model. Note that the optional arguments of the ExactGPModel (in particular the choice of 
+        mean and kernel function) also apply here thanks to the inheritance.
         
         Args:
             train_x: training input data
             train_y: training input labels
-            n_tasks: number of output tasks
             n_latents: number of latent processes
             proj_likelihood: batched independant likelihood of size n_latents for latent processes. Defaults to None.
-            init_lmc_coeffs: whether to initialize LMC coefficients with SVD of the training labels. Defaults to False.
+            init_lmc_coeffs: whether to initialize LMC coefficients with SVD of the training labels. If False, these coefficients are sampled from a normal distribution. Defaults to True.
             BDN: whether to enforce the Block Diagonal Noise approximation (see reference article), making for a block-diagonal task noise matrix. Defaults to True.
             diagonal_B: whether to parametrize a diagonal noise factor B_tilde (see reference article), a simplification which theoretically causes no loss of generality. Defaults to False.
-            scalar_B: whether to parametrize a scalar noise factor B_tilde (see reference article). Defaults to False.
-            diagonal_R: whether to parametrize a diagonal scale component for the mixing matrix (see reference article). Defaults to False.
-            mean_type: gp mean function for task-level processes. Defaults to gp.means.ConstantMean.
+            scalar_B: whether to parametrize a scalar noise factor B_tilde (see reference article). Overrides diagonal_B=False if set to True. Defaults to False.
+            diagonal_R: whether to parametrize a diagonal scale component for the mixing matrix (see reference article).
+            If set to True and scalar_B=True and BDN=True, this results in the OILMM model (see reference in the article). Defaults to False.
+            bulk: whether to parametrize the mixing matrix as a unique n_tasks x n_latents (or n_tasks x n_tasks) matrix with no
+            specific property, or as a product of its Q and R factors. The first option is only possible if no constraint is put on these factors.
+            It is generally faster and more stable, but can be less so in the "augmented" case (general PLMC) where a n_tasks x n_tasks matrix must be parametrized.
+            Defaults to True.
+            ortho_param: orthonormal parametrizzation for the mixing matrix, in the case where bulk=False and diagonal_B=False.
+            Can be 'matrix_exp' (default, the only one proved stable in previous studies), 'cayley' or 'householder'. Defaults to 'matrix_exp'. 
+            mean_type: gp mean function for task-level processes. At the moment, only a zero mean is implemented ; every other choice will throw an error.
+            Defaults to gp.means.ZeroMean.
+            noise_thresh: minimum value for the noise parameter. Has a large impact for ill-conditioned kernel matrices, which is the case of the HXS application. Defaults to 1e-6.
+            outputscales: whether to endow each latent kernel with a learned scaling factor, k(.) = a*k_base(.). This is only useful for predictive variance 
+            scaling, and may result in over-parametrization. Defaults to False
+            jitter_val: jitter value for the Cholesky decomposition of the full noise covariance matrix, and for addition to the predictive covariance matrix.
+            If None, it is set to the default gpytorch Cholesky jitter setting. Defaults to None.
         """
         if proj_likelihood is None or proj_likelihood.noise.shape[0] != n_latents:
             proj_likelihood = gp.likelihoods.GaussianLikelihood(batch_shape=torch.Size([n_latents]),
@@ -152,15 +204,15 @@ class ProjectedGPModel(ExactGPModel):
 
         if scalar_B:
             diagonal_B = True
-            self.register_parameter("log_B_tilde", torch.nn.Parameter(np.log(noise_init) * torch.ones(n_tasks - n_latents)))
+            self.register_parameter("log_B_tilde", torch.nn.Parameter(np.log(noise_thresh) * torch.ones(n_tasks - n_latents)))
             torch.nn.utils.parametrize.register_parametrization(self, "log_B_tilde", ScalarParam(bounds=(np.log(noise_thresh), -np.log(noise_thresh))))
             if BDN:
                 self.register_buffer('Y_squared_norm', (train_y**2).sum()) # case of the PLMC_fast (term for MLL computation)
         elif diagonal_B:
-            self.register_parameter("log_B_tilde", torch.nn.Parameter(np.log(noise_init)*torch.ones(n_tasks - n_latents)))
+            self.register_parameter("log_B_tilde", torch.nn.Parameter(np.log(noise_thresh)*torch.ones(n_tasks - n_latents)))
             self.register_constraint("log_B_tilde", gp.constraints.GreaterThan(np.log(noise_thresh)))
         else:
-            self.register_parameter("B_tilde_inv_chol", torch.nn.Parameter(torch.diag_embed(np.log(1/noise_init)*torch.ones(n_tasks - n_latents))))
+            self.register_parameter("B_tilde_inv_chol", torch.nn.Parameter(torch.diag_embed(np.log(1/noise_thresh)*torch.ones(n_tasks - n_latents))))
             torch.nn.utils.parametrize.register_parametrization(self, "B_tilde_inv_chol", LowerTriangularParam(bounds=(np.log(noise_thresh), -np.log(noise_thresh))))
         self.diagonal_B, self.scalar_B = diagonal_B, scalar_B
 
@@ -179,14 +231,18 @@ class ProjectedGPModel(ExactGPModel):
 
     def projected_noise( self )-> Tensor:
         """
-        Returns a vector of size n_latents containing the modeled noises of latent processes. Its diagonal embedding is the matrix Sigma_P from the article. 
+        Returns a vector containing the modeled noises of latent processes. Its diagonal embedding is the matrix Sigma_P from the article.
+        Returns:
+            Modeled noise vector of size n_latents. 
         """
         return self.likelihood.noise.squeeze(-1)
     
     # @lru_cache(maxsize=None) # caching projected data and projected matrix is appealing, but it messes with backpropagation. No workaround has been found yet
     def projection_matrix( self )-> Tensor:
         """
-        Returns matrix T from the article of shape n_tasks x n_latents, such that YT is the "projected data" seen by latent processes 
+        Returns matrix T from the reference article, such that YT is the "projected data" seen by latent processes
+        Returns:
+            Projection matrix T, of shape n_tasks x n_latents. 
         """
         Q, R, Q_orth = self.lmc_coefficients.QR()
         H_pinv = torch.linalg.solve_triangular(R.T, Q, upper=False, left=False)  # shape n_tasks x n_latents
@@ -195,7 +251,14 @@ class ProjectedGPModel(ExactGPModel):
         else:
             return H_pinv
 
-    def project_data( self, data ):
+    def project_data( self, data ) -> Tensor:
+        """
+        Projects some data labels onto the latent space.
+        Args:
+            data: data tensor of shape n_points x n_tasks
+        Returns:
+            Projected data tensor of shape n_latents x n_points. This shape convention corresponds to the batch treatment in gpytorch, not to the usual convention.
+        """
         Q, R, Q_orth = self.lmc_coefficients.QR()
         unscaled_proj = Q.T @ data.T
         Hpinv_times_Y = torch.linalg.solve_triangular(R, unscaled_proj, upper=True)  
@@ -204,7 +267,12 @@ class ProjectedGPModel(ExactGPModel):
         else:
             return Hpinv_times_Y # shape n_latents x n_points ; opposite convention to most other quantities !!
 
-    def full_likelihood( self ):
+    def full_likelihood( self ) -> gp.likelihoods.MultitaskGaussianLikelihood:
+        """
+        Outputs the task-level likelihood of the model (Sigma matrix from the reference article), including the noise of the latent processes and the discarded noise.
+        Returns:
+            Task-level likelihood of the model, with a multitask gaussian likelihood of size n_tasks.
+        """
         Q, R, Q_orth = self.lmc_coefficients.QR()
         res = gp.likelihoods.MultitaskGaussianLikelihood(num_tasks=self.n_tasks, rank=self.n_tasks, has_global_noise=False)
         QR = Q @ R
@@ -261,7 +329,7 @@ class ProjectedGPModel(ExactGPModel):
         """
         Outputs the discarded noise factor B_tilde from the reference paper. 
         Returns:
-            Discarded noise factor B_tilde (see reference paper), symmetric or even diagonal matrix of size (n_tasks - n_latents).
+            Discarded noise factor B_tilde (see reference paper), symmetric or diagonal matrix of size (n_tasks - n_latents).
         """        
         if self.diagonal_B:
             return torch.diag_embed(torch.exp(self.log_B_tilde))
@@ -270,6 +338,13 @@ class ProjectedGPModel(ExactGPModel):
             return L_inv.T @ L_inv
 
     def forward( self, x:Tensor )-> gp.distributions.MultivariateNormal:  # ! forward only returns values of the latent processes !
+        """
+        Computes the prior distribution of the latent processes at the input locations. ! This does not return task-level values !
+        Args:
+            x: input data tensor
+        Returns:
+            A batched gp multivariate normal distribution representing latent processes values, which mean has shape n_latents x n_points.
+        """
         mean_x = self.mean_module(x)
         covar_x = self.covar_module(x)
         return gp.distributions.MultivariateNormal(mean_x, covar_x)
@@ -289,7 +364,16 @@ class ProjectedGPModel(ExactGPModel):
         batch_distrib = ExactGPModel.__call__(self, x, **kwargs)
         return batch_distrib  # shape n_latents x n_points
     
-    def compute_loo(self, output=None, latent=False):
+    def compute_loo(self, output=None, latent=False) -> Tuple[Tensor, Tensor]:
+        """
+        Computes the leave-one-out (LOO) variance and error gaps (y_true - y_loo) values for the model.
+        Args:
+            output: the latent distribution of the model at the training points. If None, it is computed.
+            latent: whether to compute the leave-one-out errors at the latent level (True) or at the task level (False). Default is False.
+            train_y: the training labels. If None and latent=False, they must be stored in the model. Default is None.
+        Returns:
+            A tuple containing the LOO variances and error gaps for each task (each of size n_points x n_tasks, or n_points x n_latents if latent=True).
+        """
         train_x, train_y = self.train_inputs[0], self.train_y
         with torch.no_grad():
             if output is None:
@@ -309,9 +393,26 @@ class ProjectedGPModel(ExactGPModel):
                 loo_var = loo_var @ lmc_coeffs**2
         return loo_var, loo_delta
 
+
+    def set_train_data( self, inputs:Tensor, targets:Tensor, strict:bool=True ):
+        """
+        Replaces the current training data of the model. Overrides the parent method to store the training labels in the model.
+        """
+        super().set_train_data(inputs=inputs, targets=self.project_data(targets), strict=strict)
+        self.train_y = targets
+
     
-    def save( self):
+    def save( self) -> dict:
+        """
+        Saves the model in a dictionary. The saved elements are strictly sufficient to make mean predictions (not variances).
+        !! As of now, this method cannot accommodate : non-gaussian likelihoods, variable outputscales, nontrivial kernel decompositions,
+        priors on kernel hyperparameters, and additional kernel settings (the ker_kwargs argument of the model). !!
+        Returns:
+            A dictionary containing the model's attributes.
+        """
         dico = {}
+        dico['kernel_type'] = self.covar_module.base_kernel.__class__.__name__ if self.outputscales is None else self.covar_module.__class__.__name__
+        dico['noise_thresh'] = self.likelihood.noise_constraint.lower_bound.item()
         Q, R, Q_orth = self.lmc_coefficients.QR()
         if self.lmc_coefficients.mode == 'Q_plus':
             dico['Q_orth'] = Q_orth.detach().tolist() 
@@ -393,7 +494,7 @@ class ProjectedLMCmll(gp.mlls.ExactMarginalLogLikelihood):
         self.previous_lat = None
 
 
-    def forward(self, latent_function_dist:gp.distributions.Distribution, target:Tensor, inputs=None, *params):
+    def forward(self, latent_function_dist:gp.distributions.Distribution, target:Tensor, inputs=None, *params) -> Tensor:
         """
         Computes the value of the loss (MLL) given the model predictions and the observed values at training locations. 
         Args:

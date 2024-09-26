@@ -17,23 +17,35 @@ class MultitaskGPModel(ExactGPModel):
     """
     A multitask GP model with exact GP treatment. This class encompasses both ICM and naive LMC models.
     """
-    def __init__( self, train_x: Tensor, train_y: Tensor, n_latents: int, 
-                  likelihood:Union[Likelihood,None]=None, model_type:str='ICM', init_lmc_coeffs:bool=True,
-                  fix_diagonal:bool=True, diag_value:float=16*torch.finfo(torch.get_default_dtype()).tiny, 
+    def __init__( self,
+                  train_x: Tensor,
+                  train_y: Tensor,
+                  n_latents: int, 
+                  likelihood:Union[Likelihood,None]=None,
+                  fix_diagonal:bool=True,
+                  diag_value:float=16*torch.finfo(torch.get_default_dtype()).tiny, 
                   noise_thresh:float=1e-4,
+                  init_lmc_coeffs:bool=True,
                   outputscales:bool=False,
+                  model_type:str='ICM',
                   **kwargs):
-        """Initialization of the model. Note that the optional arguments of the ExactGPModel also apply here thanks to the inheritance.
+        """Initialization of the model. Note that the optional arguments of the ExactGPModel (in particular the choice of 
+        mean and kernel function) also apply here thanks to the inheritance.
 
         Args:
             train_x: Input data
             train_y: Input labels
-            likelihood: Likelihood of the model
-            n_tasks: number of tasks
             n_latents: number of latent functions
-            model_type: choice between 'ICM' and 'LMC' (see the reference paper). Defaults to "ICM"
-            init_lmc_coeffs: if True, initializes LMC coefficients with SVD of the training labels ; else inializes with samples from standard normal distributions. Defaults to True
-            fix_diagonal: for ICM only. If True, fixes the learned diagonal term of the task covariance matrix, accounting for task-specific (non-shared) latent processes. Defaults to False
+            likelihood: gpytorch likelihood function for the outputs. If none is provided, a default MultitaskGaussianLikelihood is used. Defaults to None.
+            fix_diagonal: for ICM only. If True, fixes the learned diagonal term of the task covariance matrix, accounting for task-specific (non-shared)
+            latent processes. The efficient storage of the model (with a cache of size n_latents x n_points) is only possible if this diagonal term
+            is fixed to zero. Defaults to True.
+            diag_value: value of the diagonal term of the task covariance matrix if fix_diagonal is set to True. Defaults to machine precision.
+            init_lmc_coeffs: whether to initialize LMC coefficients with SVD of the training labels. If False, these coefficients are sampled from a normal distribution. Defaults to True.
+            outputscales: whether to endow each latent kernel with a learned scaling factor, k(.) = a*k_base(.). This is only useful for predictive variance 
+            scaling, and may result in over-parametrization. Defaults to False
+            model_type: choice between 'ICM' and 'LMC'. The latter is very computationnally-heavy and unstable, so it should only be used for very specific
+            experimental purposes. Defaults to "ICM"
         """
         n_data, n_tasks = train_y.shape
         if likelihood is None:
