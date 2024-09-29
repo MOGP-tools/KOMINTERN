@@ -8,6 +8,7 @@ from gpytorch.means.mean import Mean
 from gpytorch.kernels.kernel import Kernel
 from gpytorch.likelihoods.likelihood import Likelihood
 from gpytorch.mlls.marginal_log_likelihood import MarginalLogLikelihood
+from gpytorch.models.exact_prediction_strategies import prediction_strategy
 from torch import Tensor
 
 from .utilities import handle_covar_ 
@@ -52,18 +53,19 @@ class ExactGPModel(gp.models.ExactGP):
             jitter_val: jitter value for the Cholesky decomposition of the kernel matrix in specific leave-one-out computations. Defaults to 1e-6.
         """
         if likelihood is None:
+            noise_init = 10 * noise_thresh
             if n_tasks == 1:
                 likelihood = gp.likelihoods.GaussianLikelihood(noise_constraint=gp.constraints.GreaterThan(noise_thresh))
-                likelihood.noise = noise_thresh
+                likelihood.noise = noise_init
             elif batch_lik :
                 likelihood = gp.likelihoods.GaussianLikelihood(batch_shape=torch.Size([n_tasks]),
                                                     noise_constraint=gp.constraints.GreaterThan(noise_thresh))
-                likelihood.noise = noise_thresh * torch.ones_like(likelihood.noise)
+                likelihood.noise = noise_init * torch.ones_like(likelihood.noise)
             else:
                 likelihood = gp.likelihoods.MultitaskGaussianLikelihood(num_tasks=n_tasks,
                                                     noise_constraint=gp.constraints.GreaterThan(noise_thresh))
-                likelihood.noise = noise_thresh
-                likelihood.task_noises = torch.ones(n_tasks, device=train_y.device) * noise_thresh
+                likelihood.noise = noise_init
+                likelihood.task_noises = torch.ones(n_tasks, device=train_y.device) * noise_init
                 
         super(ExactGPModel, self).__init__(train_x, train_y, likelihood)
 
@@ -153,7 +155,11 @@ class ExactGPModel(gp.models.ExactGP):
         Returns:
             The condition number of the training kernel matrix
         """
-        K_plus = self.prediction_strategy.lik_train_train_covar.evaluate_kernel().to_dense()
+        with torch.no_grad():
+            if not self.prediction_strategy:
+                self.eval()
+                __ = self(torch.zeros_like(self.train_inputs[0])) # to initialize the prediction strategy
+            K_plus = self.prediction_strategy.lik_train_train_covar.evaluate_kernel().to_dense()
         return torch.linalg.cond(K_plus)
     
     def compute_loo(self, output=None, complex_mean=False) -> Tuple[Tensor, Tensor]:

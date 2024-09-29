@@ -55,8 +55,6 @@ def process_data(xs, cc, xs_keys=None, tensor_output=False):
 
 ##---------------------------------------------------------------------------------------------------------------------------------
 ## Training data
-strategy = 'Tdownsampling'
-# task-level scores. 'Ldownsampling' for latent-level scores
 norm_func = torch.std
 init_tag = 'sobol_PIJ_256'
 init_data = pd.read_csv(root + assembly_name + '_' + hom_name + '_' + init_tag + '_xs.csv', index_col=0)
@@ -88,26 +86,34 @@ if external_tests:
 ##------------------------------------------------------------------------------------------------------------------------
 
 ## Sampling setings
+strategy = 'Tdownsampling'
+# task-level scores. 'Ldownsampling' for latent-level scores
 mod_to_run = 'plmc'
 retrain = False
 aggr_func = prod_func
 renormalize = True
 batch_size = 1
-final_set_size = 100
-n_steps = final_set_size - len(train_x) if strategy not in ['Tdownsampling', 'Ldownsampling'] else len(train_x) - final_set_size
-first_point = len(train_x) if strategy not in ['Tdownsampling', 'Ldownsampling'] else 0
-points_iter = range(first_point, first_point + n_steps, batch_size)
+final_set_size = 10
+stopp_crit = 'RMSE'
+stopp_tol = 2e-1 # If the deterioration of the stopp_crit metric is above this threshold, the sampling is stopped
 n_tests = 10
-freq_test = len(points_iter) // n_tests if (n_tests > 0 and external_tests) else len(points_iter) + 1
 verbose = True
-study_tag_base = '{0}adapt_{1}p_{2}'.format(strategy, final_set_size, mod_to_run)
+
+n_steps = len(train_x) - final_set_size
+points_iter = range(0, n_steps, batch_size)
+freq_test = len(points_iter) // n_tests if (n_tests > 0 and external_tests) else len(points_iter) + 1
+study_tag_base = '{0}adapt_{1}'.format(strategy, mod_to_run)
+if stopp_tol is None:
+    study_tag_base += '_{0}pts'.format(final_set_size)
+else:
+    study_tag_base += '_tol{0}'.format(stopp_tol)
 if not retrain:
     study_tag_base += '_noretrain'
 print('Name of the current experiment :', study_tag_base)
 
 ##------------------------------------------------------------------------------------------------------------------------
 ## Training settings
-stopp_crit = 'exp'
+train_stopp_crit = 'exp'
 sched = 'lin'
 lthreshes = {'max':1e-5, 'mean':1e-7, 'exp':1e-9}
 patiences = {'max':50, 'mean':500, 'exp':50}
@@ -118,9 +124,9 @@ train_args = {
     'lr_max':1e-2,
     'lr_min':2e-3,
     'n_iter':50000,
-    'stopp_crit':stopp_crit,
-    'loss_thresh':lthreshes[stopp_crit],
-    'patience':patiences[stopp_crit], 
+    'stopp_crit':train_stopp_crit,
+    'loss_thresh':lthreshes[train_stopp_crit],
+    'patience':patiences[train_stopp_crit], 
     'print_loss':print_loss,
     'freq_print':freq_print,
 }
@@ -154,33 +160,27 @@ lazy_kwargs = {'noise_val':1e-7, 'store_full_y':True,}
 if mod_to_run == 'plmc':
     model = ProjectedGPModel(train_x, train_labels, n_lat, kernel_type=ker_type, **plmc_kwargs)
 elif mod_to_run == 'lazy_lmc':
-    train_x = (train_x + 1) / 2
-    if external_tests:
-        test_x = (test_x + 1) / 2
     model = LazyLMCModel(train_x, train_labels, n_lat, **lazy_kwargs)
 
 met_dict = {
-    'alpha_CI': lambda rwm : torch.mean((rwm['errs'] < 2 * rwm['sigmas']).float()),
-    'PVA': lambda rwm : torch.log(torch.mean(rwm['errs2'] / rwm['vars'], dim=0)).mean(),
     'R2': lambda rwm : (1 - torch.mean(rwm['errs2'], dim=0) / torch.var(rwm['y_test'], dim=0)).mean(),
     'RMSE': lambda rwm : torch.sqrt(rwm['errs2'].mean()),
     'mean_err_abs': lambda rwm : rwm['errs'].mean(),
     'max_err_abs': lambda rwm : rwm['errs'].max(),
-    'mean_err_quant05': lambda rwm : torch.quantile(rwm['errs'], 0.05),
-    'mean_err_quant95': lambda rwm : torch.quantile(rwm['errs'], 0.95),
-    'mean_err_quant99': lambda rwm : torch.quantile(rwm['errs'], 0.99),
 }
 ##------------------------------------------------------------------------------------------------------------------------
 ## Iteration
 
+sampler = ActiveSampler(model, strategy, aggr_func, current_data=train_labels, current_X=train_x)
+
 progress = {}
 start = time.time()
 tstep = start                    
-sampler = ActiveSampler(model, strategy, aggr_func, current_data=train_labels, current_X=train_x)
 first_run = True
 optimizer = None
 for k in points_iter:
     print('\n Current iter :', k)
+
     # Data update
     sampler.modify_train_set(new_X=None, new_Y=None, normalize=renormalize, norm_func=norm_func)
 
@@ -191,16 +191,14 @@ for k in points_iter:
     else:
         train_stats = eval_loo(model, train_labels, met_dict=met_dict) # only to track the sampling process
 
-    if verbose:
-        print('\n LOO results : \n')
-        for key, value in train_stats.items():
-            print(key, value)
-
     new_points, best_score = sampler.find_next_points(n_samples=batch_size)
     new_time = time.time()
     tstep = new_time
-    progress[k] = {'total_time':new_time - start, 'time':new_time - tstep, 'score':best_score}
+    progress[k] = {'total_time':new_time - start, 'time':new_time - tstep, 'score':best_score, 'av_cond':model.kernel_cond().cpu().numpy().mean()}
     progress[k].update(train_stats)
+    stopp_crit_val = progress[k][stopp_crit]
+    if verbose:
+        print(progress[k])
 
     make_test = (k % freq_test == 0) or (n_tests > 0 and k == list(points_iter)[-1])
     if make_test:
@@ -212,10 +210,13 @@ for k in points_iter:
         progress[k].update(test_stats)
 
     if first_run:
+        first_stopp_crit_val = stopp_crit_val
         train_args['lr_max'] = train_args['lr_min'] # After initial training, the learning rate is kept minimal
         train_args['n_iter'] = 10000 # For a shorter sampling process ; this bound is rarely attained anyway. Can also evolve during sampling
         first_run = False     
     
+    if 1 - first_stopp_crit_val / stopp_crit_val > stopp_tol:
+        break
     i = k + batch_size - 1
 
     ##------------------------------------------------------------------------------------------------------------------------

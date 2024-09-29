@@ -13,6 +13,8 @@ os.environ["NUMEXPR_NUM_THREADS"] = str(num_threads) # export NUMEXPR_NUM_THREAD
 import numpy as np
 np.random.seed(seed=12)
 import pandas as pd
+from sklearn.linear_model import ARDRegression
+from scipy.interpolate import RegularGridInterpolator
 
 import torch
 torch.manual_seed(12)
@@ -20,23 +22,18 @@ torch.backends.cuda.matmul.allow_tf32 = False
 torch.set_default_dtype(torch.float64)
 import gpytorch as gp
 
-from komi.utilities import transfo_mesh, SplineKernel, LinearMean, PolynomialMean, max_norm_func, compute_macro_errs, \
-i_mean, i_log, i_sqrt, i_var, i_quantile
+from komi.utilities import transfo_mesh, SplineKernel, LinearMean, PolynomialMean, compute_macro_errs, \
+i_mean, i_log, i_sqrt, i_var, i_quantile, i_tofloat, max_norm_func, std_norm_func, cround
 from komi.base_gp import ExactGPModel
 from komi.mogp_lazy import LazyLMCModel
 from komi.mogp_var import VariationalMultitaskGPModel
 from komi.mogp_plmc import ProjectedGPModel, ProjectedLMCmll
 from komi.mogp_icm import MultitaskGPModel
 from komi.train_gp import train_model, eval_model, eval_loo, train_parallel, eval_parallel
+from komi.bayes_poly_reg import BayesPolyRegressor
+from komi.xs_set_grids import XsSetGrids
 
 # from custom_profiler import profiler, magic_profiler # info : https://github.com/KarGeekrie/customProfiler
-
-def cround(n, ndec=2):
-    if n == 0:
-        return n
-    else:
-        d = np.ceil(-np.log10(abs(n))).astype(int)
-        return np.round(n, d + ndec)
 
 def process_data(xs, var_ranges, variables, xs_keys=None, cc=None, filter_thresh=None):
     if filter_thresh is not None:
@@ -59,7 +56,7 @@ def process_data(xs, var_ranges, variables, xs_keys=None, cc=None, filter_thresh
     return X, Y, xs_keys, cc 
     
 met_dict = {
-    'alpha_CI': lambda rwm : i_mean((rwm['errs'] < 2 * rwm['sigmas']).float()),
+    'alpha_CI': lambda rwm : i_mean(i_tofloat(rwm['errs'] < 2 * rwm['sigmas'])),
     'PVA': lambda rwm : i_log(i_mean(rwm['errs2'] / rwm['vars'], dim=0)).mean(),
     'R2': lambda rwm : (1 - i_mean(rwm['errs2'], dim=0) / i_var(rwm['y_test'], dim=0)).mean(),
     'RMSE': lambda rwm : i_sqrt(rwm['errs2'].mean()),
@@ -85,6 +82,8 @@ export_data_to_np = False
 save_torch_model = True
 store_model = True
 file_format = 'json' # 'json' or 'pickle'
+poly_baseline = False
+multilin_baseline = False
 
 if __name__ == "__main__":
 
@@ -109,10 +108,21 @@ if __name__ == "__main__":
     X_test, Y_test, __ , test_cc = process_data(test_df, var_ranges, variables, cc=test_cc, xs_keys=xs_keys)
     # X, X_test, Y, Y_test = X[::2], X_test[::2], Y[::2, :15], Y_test[::2, :15]
     n_points, n_tasks = Y.shape
-    norm_func = torch.std
+    norm_func = std_norm_func
     means, devs = Y.mean(dim=0), norm_func(Y, dim=0)
     Y = (Y - means) / devs
     Y_test = (Y_test - means) / devs
+
+    ## Grid data for the multilin baseline
+    if multilin_baseline:
+        xs_grids, means_grids, devs_grids = {}, {}, {}
+        grid_tag = 'grid_PIJ.pickle'
+        assembly_name = '' # string identifying the assembly in xs_keys above
+        xs_set_grid = XsSetGrids(pickle_name=root + case + '_' + grid_tag).unpack_cr(4)['no_rod']
+        xs_grids, multiparam = xs_set_grid.xs_dict, xs_set_grid.multiparam
+        multiparam['root_bu'], multiparam['tm'] = np.sqrt(multiparam['bu']), multiparam['tm_dm']
+        lin_values = [multiparam[var] for var in variables]
+        # !! Caution : this could correspond to different variable bounds than the ones used for the GP model !!
 
     ## Eventually export data
     exproot = '../results/'
@@ -125,16 +135,16 @@ if __name__ == "__main__":
 
     ##--------------------------------------------------------------------------------
     ## Training setting
-    mod_to_run = 'lazy_lmc' # 'icm', 'plmc', 'vlmc', 'lazy_lmc', 'sogp'
+    mod_to_run = 'icm' # 'icm', 'plmc', 'vlmc', 'lazy_lmc', 'sogp'
     stopp_crit = 'exp'
     sched = 'lin'
     lthreshes = {'max':1e-5, 'mean':1e-7, 'exp':1e-10}
     patiences = {'max':50, 'mean':500, 'exp':50}
     train_args = {
-        'gpu':False,
+        'gpu':True,
         'lr_max':1e-2,
         'lr_min':2e-3,
-        'n_iter':1000,
+        'n_iter':500,
         'stopp_crit':stopp_crit,
         'loss_thresh':lthreshes[stopp_crit],
         'patience':patiences[stopp_crit], 
@@ -211,7 +221,6 @@ if __name__ == "__main__":
         model = ProjectedGPModel(X, Y, n_lat, kernel_type=ker_type, **plmc_kwargs)
 
     if mod_to_run == 'lazy_lmc':
-        X, X_test = (X+1)/2, (X_test+1)/2 # The SplineKernel is only defined on [0;1]^d, while our data is normalized on [-1;1]^d
         model = LazyLMCModel(X, Y, n_lat, **lazy_kwargs)
 
     if mod_to_run == 'sogp':
@@ -244,7 +253,7 @@ if __name__ == "__main__":
     if make_preds:
         extra_context = {'skip_pred_var':gp.settings.skip_posterior_variances(state=isinstance(model, MultitaskGPModel))}
         # The default method for computing the variance of the ICM is memory-intensive. Switching to custom method
-        test_args = {'gpu':False}
+        test_args = {'gpu':True}
         if mod_to_run == 'sogp':
             preds, sigmas, pred_metrics = eval_parallel(mod_list, X_test, Y_test, argus=test_args, max_workers=max_workers, 
                                                          extra_context_managers=extra_context, met_dict=met_dict, devs=devs)
@@ -256,7 +265,52 @@ if __name__ == "__main__":
             for key, value in pred_metrics.items():
                 print(key, cround(value, ndec=ndec))
 
+    ## Printing condition numbers (doing it here ensures that the kernel matrix is not computed twice)
+    print('\n Kernels condition numbers : ', model.kernel_cond())
+
     ##--------------------------------------------------------------------------------
+    ## Baselines
+    if poly_baseline or multilin_baseline:
+        X, Y, X_test, Y_test, devs, means = X.numpy(), Y.numpy(), X_test.numpy(), Y_test.numpy(), devs.numpy(), means.numpy()
+    if poly_baseline:
+        poly_model = BayesPolyRegressor(degree=7, n_tasks=n_tasks, tol=1e-5, max_iter=1000)
+        # poly_model = BayesPolyRegressor(degree=7, n_tasks=n_tasks, tol=1e-5, max_iter=1000, model = ARDRegression)
+        poly_train_stats = poly_model.train(X, Y, compute_score=True, coeff_info=False)
+        print('\n Poly model training statistics \n')
+        for key, value in poly_train_stats.items():
+            print(key, cround(value, ndec=ndec))
+
+        poly_test_stats = poly_model.evaluate(X_test, Y_test, met_dict=met_dict, concs=test_cc, keys=xs_keys, devs=devs)
+        print('\n Poly model test statistics \n')
+        for key, value in poly_test_stats.items():
+            print(key, cround(value, ndec=ndec))
+
+    if multilin_baseline:
+        Y_test_renorm = Y_test * devs + means # un-normalize the outputs
+        X_test_renorm = X_test.copy()
+        Y_test_gridnorm = np.zeros_like(Y_test)
+        for i in range(len(variables)):
+            X_test_renorm[:, i] = transfo_mesh(lin_values[i], value=X_test[:,i], reverse=True) # un-normalize the inputs
+        lin_errs, u_lin_errs = np.zeros_like(Y_test), np.zeros_like(Y_test)
+        for i, key in enumerate(xs_keys):
+            xs = xs_grids[key]
+            interpolator = RegularGridInterpolator(lin_values, xs)
+            pred_y_lin = interpolator(X_test_renorm)
+            mean_grid, dev_grid = xs.mean(), norm_func(xs)
+            u_lin_errs[:,i] = np.abs(Y_test_renorm[:,i] - pred_y_lin)
+            lin_errs[:,i] = u_lin_errs[:,i] / dev_grid
+            Y_test_gridnorm[:,i] = (Y_test_renorm[:,i] - mean_grid) / dev_grid
+        met_dict_lin = met_dict.copy()
+        met_dict_lin.pop('alpha_CI')
+        met_dict_lin.pop('PVA')
+        lin_stats = {}
+        raw_mets = {'errs':lin_errs, 'errs2':lin_errs**2, 'u_errs':u_lin_errs, 'y_test':Y_test_gridnorm, 'concs':test_cc, 'keys':xs_keys, 'devs':devs}
+        for met, func in met_dict_lin.items():
+            lin_stats[met] = func(raw_mets)
+        print('\n Multilinear model test statistics \n')
+        for key, value in lin_stats.items():
+            print(key, cround(value, ndec=ndec))
+
     ##--------------------------------------------------------------------------------
     ## Saving model and results
     dico = {}

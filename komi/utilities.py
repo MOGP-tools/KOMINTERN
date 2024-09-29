@@ -17,6 +17,11 @@ def tensor_iter( *iterators ):
             for rest in tensor_iter(*iterators[1:]):
                 yield (first,) + rest
 
+def cround(n, ndec=2):
+    d = np.ceil(-np.log10(abs(n + 1e-16))).astype(int)
+    d = max(d) if hasattr(d, 'shape') and len(d.shape) > 0 else d # If d is array-like
+    return np.round(n, d + ndec)
+
 ## Library-independent metrics
 def i_mean(x, dim=None):
     if isinstance(x, torch.Tensor):
@@ -47,6 +52,11 @@ def i_quantile(x, q):
     else:
         return np.quantile(x, q)
 
+def i_tofloat(x):
+    if isinstance(x, torch.Tensor):
+        return x.float()
+    else:
+        return x.astype(float)
 ##----------------------------------------------------------------------------------------------------------------------
 
 ## Custom means and kernels
@@ -128,13 +138,19 @@ def compute_macro_errs(errs, concs, keys, cc_words_idx=(0,1)):
     return res
 
 
-def transfo_mesh( array, return_coeffs=False, value=None, reverse=False):
+def transfo_mesh( array, return_coeffs=False, value=None, reverse=False, target='01'):
     array = np.asarray(array)
     a, b = array[0], array[-1]
     if reverse:
-        m, p = (b-a)/2, (a+b)/2
+        if target == '01':
+            m, p = (b - a), a
+        elif target == '-11':
+            m, p = (b-a)/2, (a+b)/2
     else:
-        m, p = 2 / (b - a), (a + b) / (a - b)
+        if target == '01':
+            m, p = 1 / (b - a), -a / (b - a)
+        elif target == '-11':
+            m, p = 2 / (b - a), (a + b) / (a - b)
     if return_coeffs:
         return m, p
     if value is not None:
@@ -143,9 +159,17 @@ def transfo_mesh( array, return_coeffs=False, value=None, reverse=False):
         return m * array + p
 
 
-def max_norm_func( x: Tensor, axis: int = -1):
-    return torch.max(torch.abs(x), dim=axis).values
-
+def max_norm_func( x: Tensor, dim = None):
+    if isinstance(x, torch.Tensor):
+        return torch.max(torch.abs(x), dim=dim).values
+    else:
+        return np.max(np.abs(x), axis=dim)
+    
+def std_norm_func( x: Tensor, dim = None):
+    if isinstance(x, torch.Tensor):
+        return torch.std(x, dim=dim)
+    else:
+        return np.std(x, axis=dim)
 
 class LeaveOneOutPseudoLikelihood(gp.mlls.exact_marginal_log_likelihood.ExactMarginalLogLikelihood):
     def __init__( self, likelihood, model, train_x, train_y):

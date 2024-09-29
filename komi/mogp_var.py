@@ -90,9 +90,15 @@ class VariationalMultitaskGPModel(gp.models.ApproximateGP):
         if ker_kwargs is None:
             ker_kwargs = {}
         self.n_points, self.dim = train_x.shape
-        if train_y is not None and train_y.shape[1]!=n_tasks:
-            n_tasks = train_y.shape[1]
-            warnings.warn('Number of tasks in the training labels does not match the specified number of tasks. Defaulting to the number of tasks in the training labels.')
+        if n_tasks is None :
+            if train_y is not None :
+                n_tasks = train_y.shape[1]
+            else:
+                raise ValueError('Number of tasks must be specified if no training labels are provided.')
+        else:
+            if train_y is not None and train_y.shape[1]!=n_tasks:
+                n_tasks = train_y.shape[1]
+                warnings.warn('Number of tasks in the training labels does not match the specified number of tasks. Defaulting to the number of tasks in the training labels.')
 
         if float(train_ind_ratio) == 1.:
             warnings.warn('Caution : inducing points not learned !')
@@ -126,10 +132,11 @@ class VariationalMultitaskGPModel(gp.models.ApproximateGP):
         self.mean_module = gp.means.ZeroMean(batch_shape=torch.Size([n_latents])) #in gp, latent processes can have non-zero means, which we wish to avoid
 
         if likelihood is None:
+            noise_init = 10 * noise_thresh
             likelihood = gp.likelihoods.MultitaskGaussianLikelihood(num_tasks=n_tasks,
                                                                     noise_constraint=gp.constraints.GreaterThan(noise_thresh))
-            likelihood.noise = noise_thresh
-            likelihood.task_noises = torch.ones(n_tasks, device=train_y.device) * noise_thresh
+            likelihood.noise = noise_init
+            likelihood.task_noises = torch.ones(n_tasks, device=train_y.device) * noise_init
 
         self.likelihood = likelihood
         self.n_tasks, self.n_latents, self.decomp = n_tasks, n_latents, decomp
@@ -215,9 +222,21 @@ class VariationalMultitaskGPModel(gp.models.ApproximateGP):
         Returns:
             A batched gp multivariate normal distribution representing latent processes values, which mean has shape n_latents x n_points.
         """
-        return self.base_variational_strategy(x, prior=prior, **kwargs)
+        return self.variational_strategy.base_variational_strategy(x, prior=prior, **kwargs)
     
-    def save( self) -> dict:
+    def kernel_cond( self ) -> Tensor:
+        """
+        Computes the condition number of the inducing points kernel matrix.
+        Returns:
+            The condition number of the inducing points kernel matrix
+        """
+        with torch.no_grad():
+            # Nice point : self.variational_strategy.base_variational_strategy.prior_distribution.lazy_covariance_matrix is cached by gpytorch
+            K_plus = self.variational_strategy.base_variational_strategy.prior_distribution.lazy_covariance_matrix.evaluate()
+        return torch.linalg.cond(K_plus)
+
+    
+    def save( self, extra_terms = False) -> dict:
         """
         Saves the model in a dictionary. The saved elements are strictly sufficient to make mean predictions (not variances).
         !! As of now, this method cannot accommodate : non-gaussian likelihoods, variable outputscales, nontrivial kernel decompositions,
@@ -230,30 +249,33 @@ class VariationalMultitaskGPModel(gp.models.ApproximateGP):
         dico = {}
         dico['kernel_type'] = self.covar_module.base_kernel.__class__.__name__ if self.outputscales is None else self.covar_module.__class__.__name__
         dico['mean_type'] = self.mean_module.__class__.__name__
-        dico['noise_thresh'] = self.likelihood.noise_constraint.lower_bound.item()
         likelihood = self.likelihood
-        dico['lmc_coeffs'] = self.lmc_coefficients().detach().tolist()
-        noises = likelihood.noise.detach() if hasattr(likelihood, 'noise') else 0.
-        if hasattr(likelihood, 'task_noises'):
-            noises = likelihood.task_noises.detach() + noises
-        elif hasattr(likelihood, 'task_noise_covar'):
-            dico['task_noise_covar'] = likelihood.task_noise_covar.detach().tolist()
-        dico['noises'] = noises.tolist()
-        if self.outputscales:
-            dico['outputscales'] = self.outputscale().tolist()
-        dico['lscales'] = self.lscales().tolist()
-        inducing_points = self.variational_strategy.base_variational_strategy.inducing_points.detach()
-        dico['inducing_points'] = inducing_points.tolist()
-        with gp.settings.skip_posterior_variances(state=True), torch.no_grad():
-            _ = self(torch.zeros_like(inducing_points)) # this is to compute the mean cache
-        if not isinstance(self.variational_strategy.base_variational_strategy, gp.variational.UnwhitenedVariationalStrategy):
-            warnings.warn('Model storage has only been tested for the UnwhitenedVariationalStrategy of gpytorch. \
-                           The current strategy may not be supported.')
-        dico['mean_cache'] = self.variational_strategy.base_variational_strategy._mean_cache.squeeze().detach().tolist()
-        if isinstance(self.variational_strategy.base_variational_strategy._variational_distribution, gp.variational.CholeskyVariationalDistribution):
-            dico['distrib_covar'] = self.variational_strategy.base_variational_strategy._variational_distribution.chol_variational_covar.detach().tolist()
-        else:
-            warnings.warn('The variational covariance was not stored, either deliberately (delta variational distribution) or because a nonstandard distribution was used.')
+        with torch.no_grad():
+            dico['lmc_coeffs'] = self.lmc_coefficients().tolist()
+            if self.outputscales:
+                dico['outputscales'] = self.outputscale().tolist()
+            dico['lscales'] = self.lscales().tolist()
+            inducing_points = self.variational_strategy.base_variational_strategy.inducing_points
+            dico['inducing_points'] = inducing_points.tolist()
+            with gp.settings.skip_posterior_variances(state=True), torch.no_grad():
+                _ = self(torch.zeros_like(inducing_points)) # this is to compute the mean cache
+            if not isinstance(self.variational_strategy.base_variational_strategy, gp.variational.UnwhitenedVariationalStrategy):
+                warnings.warn('Model storage has only been tested for the UnwhitenedVariationalStrategy of gpytorch. \
+                            The current strategy may not be supported.')
+            dico['mean_cache'] = self.variational_strategy.base_variational_strategy._mean_cache.squeeze().tolist()
+
+            if extra_terms:
+                dico['noise_thresh'] = self.likelihood.raw_noise_constraint.lower_bound.item()
+                noises = likelihood.noise if hasattr(likelihood, 'noise') else 0.
+                if hasattr(likelihood, 'task_noises'):
+                    noises = likelihood.task_noises + noises
+                elif hasattr(likelihood, 'task_noise_covar'):
+                    dico['task_noise_covar'] = likelihood.task_noise_covar.tolist()
+                dico['noises'] = noises.tolist()
+                if isinstance(self.variational_strategy.base_variational_strategy._variational_distribution, gp.variational.CholeskyVariationalDistribution):
+                    dico['distrib_covar'] = self.variational_strategy.base_variational_strategy._variational_distribution.chol_variational_covar.tolist()
+                else:
+                    warnings.warn('The variational covariance was not stored, either deliberately (delta variational distribution) or because a nonstandard distribution was used.')
         return dico
     
     def default_mll(self):

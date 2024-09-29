@@ -48,11 +48,12 @@ class MultitaskGPModel(ExactGPModel):
             experimental purposes. Defaults to "ICM"
         """
         n_data, n_tasks = train_y.shape
+        noise_init = 10 * noise_thresh
         if likelihood is None:
             likelihood = gp.likelihoods.MultitaskGaussianLikelihood(num_tasks=n_tasks,
                                                     noise_constraint=gp.constraints.GreaterThan(noise_thresh))
-            likelihood.noise = noise_thresh
-            likelihood.task_noises = torch.ones(n_tasks, device=train_y.device) * noise_thresh
+            likelihood.noise = noise_init
+            likelihood.task_noises = torch.ones(n_tasks, device=train_y.device) * noise_init
             
         super(MultitaskGPModel, self).__init__(train_x, train_y, likelihood, n_tasks=1, outputscales=outputscales, **kwargs) # we build upon a single-task GP, created by calling parent class
 
@@ -253,34 +254,53 @@ class MultitaskGPModel(ExactGPModel):
             identity = torch.eye(*K.shape[-2:], dtype=K.dtype, device=K.device)
             loo_var = 1.0 / L._cholesky_solve(identity, upper=False).diagonal(dim1=-1, dim2=-2)
             loo_delta = L._cholesky_solve(targets, upper=False).squeeze(-1) * loo_var
-            loo_var = torch.reshape(loo_var.detach(), train_y.shape)
-            loo_delta = torch.reshape(loo_delta.detach(), train_y.shape)
+            loo_var = torch.reshape(loo_var, train_y.shape)
+            loo_delta = torch.reshape(loo_delta, train_y.shape)
         return loo_var, loo_delta
     
+    def kernel_cond( self ) -> Tensor:
+        """
+        Computes the condition number of the training data kernel matrix.
+        Returns:
+            The condition number of the training data kernel matrix
+        """
+        with torch.no_grad():
+            K = self.covar_module.data_covar_module(self.train_inputs[0]).evaluate()
+            K_plus_noise = K  + torch.eye(len(self.train_inputs[0]), device=self.train_inputs[0].device)
+            # In the efficient implementation of the ICM, used in particular in gpytorch, the noise "seen" by the data kernel is always 1.
+            # The amplitude of this noise is reported onto the task kernel instead.
+            # See : 
+            # Rakitsch, B., Lippert, C., Borgwardt, K., & Stegle, O. (2013).
+            # It is all in the noise: Efficient multi-task Gaussian process inference with structured residuals.
+            #Advances in neural information processing systems, 26.
+        return torch.linalg.cond(K_plus_noise)
+
     def save( self, extra_terms=False):
         self.eval()
         dico = {}
-        dico['lmc_coeffs'] = self.lmc_coefficients().detach().tolist()
-        if self.outputscales:
-            dico['outputscales'] = self.outputscale().tolist()
-        dico['lscales'] = self.lscales().tolist()
-        with gp.beta_features.checkpoint_kernel(0),\
-                gp.settings.skip_posterior_variances(state=True),\
-                torch.no_grad():
-            _ = self(torch.zeros_like(self.train_inputs[0])) # to compute the mean_cache
-            gp_cache = self.prediction_strategy.mean_cache
-            n_points, n_tasks = self.train_targets.shape
-            res = gp_cache.reshape((n_points, n_tasks)).matmul(self.covar_module.task_covar_module.covar_matrix)
-            dico['mean_cache'] = res.detach().tolist()
+        with torch.no_grad():
+            dico['lmc_coeffs'] = self.lmc_coefficients().tolist()
+            if self.outputscales:
+                dico['outputscales'] = self.outputscale().tolist()
+            dico['lscales'] = self.lscales().tolist()
+            with gp.beta_features.checkpoint_kernel(0),\
+                    gp.settings.skip_posterior_variances(state=True),\
+                    torch.no_grad():
+                _ = self(torch.zeros_like(self.train_inputs[0])) # to compute the mean_cache
+                gp_cache = self.prediction_strategy.mean_cache
+                n_points, n_tasks = self.train_targets.shape
+                res = gp_cache.reshape((n_points, n_tasks)).matmul(self.covar_module.task_covar_module.covar_matrix)
+                dico['mean_cache'] = res.tolist()
 
-        if extra_terms:
-            likelihood = self.likelihood
-            noises = likelihood.noise.detach() if hasattr(likelihood, 'noise') else 0.
-            if hasattr(likelihood, 'task_noises'):
-                noises = self.likelihood.task_noises.detach() + noises
-            elif hasattr(likelihood, 'task_noise_covar'):
-                dico['task_noise_covar'] = likelihood.task_noise_covar.detach().tolist()
-            dico['noises'] = noises.tolist()
+            if extra_terms:
+                likelihood = self.likelihood
+                dico['noise_thresh'] = likelihood.raw_noise_constraint.lower_bound.item()
+                noises = likelihood.noise if hasattr(likelihood, 'noise') else 0.
+                if hasattr(likelihood, 'task_noises'):
+                    noises = self.likelihood.task_noises + noises
+                elif hasattr(likelihood, 'task_noise_covar'):
+                    dico['task_noise_covar'] = likelihood.task_noise_covar.tolist()
+                dico['noises'] = noises.tolist()
         
         return dico
 

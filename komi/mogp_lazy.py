@@ -15,6 +15,9 @@ from .utilities import SplineKernel
 class LazyLMCModel(ExactGPModel):
     """
     A training-less LMC-like model.
+    For the implementation with gpytorch to be convenient, each latent process is endowed with its own kernel,
+    while these kernels are in reality identical ; therefore, all kernel-based operations are redundant.
+    This should be improved in future versions.
     """
     def __init__( self,
                   train_x:Tensor,
@@ -36,7 +39,7 @@ class LazyLMCModel(ExactGPModel):
         """
         n_points, n_tasks = train_y.shape
         proj_likelihood = gp.likelihoods.GaussianLikelihood(batch_shape=torch.Size([n_latents]),
-                                        noise_constraint=gp.constraints.GreaterThan(noise_val))
+                                        noise_constraint=gp.constraints.GreaterThan(0.5 * noise_val))
         proj_likelihood.noise = noise_val
         
         SVD = TruncatedSVD(n_components=n_latents)
@@ -155,7 +158,7 @@ class LazyLMCModel(ExactGPModel):
             L = K.cholesky(upper=False)
             loo_var = 1.0 / L._cholesky_solve(identity[None,:], upper=False).diagonal(dim1=-1, dim2=-2)
             loo_delta = L._cholesky_solve(y_proj.unsqueeze(-1), upper=False).squeeze(-1) * loo_var
-            loo_var, loo_delta = loo_var.detach().T, loo_delta.detach().T
+            loo_var, loo_delta = loo_var.T, loo_delta.T
             if not latent:
                 lmc_coeffs = self.lmc_coefficients()
                 e_loo_raw = (loo_delta @ lmc_coeffs)

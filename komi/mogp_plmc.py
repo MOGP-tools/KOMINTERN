@@ -166,10 +166,11 @@ class ProjectedGPModel(ExactGPModel):
             jitter_val: jitter value for the Cholesky decomposition of the full noise covariance matrix, and for addition to the predictive covariance matrix.
             If None, it is set to the default gpytorch Cholesky jitter setting. Defaults to None.
         """
+        noise_init = 10 * noise_thresh
         if proj_likelihood is None or proj_likelihood.noise.shape[0] != n_latents:
             proj_likelihood = gp.likelihoods.GaussianLikelihood(batch_shape=torch.Size([n_latents]),
                                                     noise_constraint=gp.constraints.GreaterThan(noise_thresh))
-            proj_likelihood.noise = noise_thresh * torch.ones_like(proj_likelihood.noise)
+            proj_likelihood.noise = noise_init * torch.ones_like(proj_likelihood.noise)
             
         if proj_likelihood.noise.shape[0] != n_latents:
             warnings.warn("In projected GP model the dimension of the likelihood is the number of latent processes. "
@@ -204,15 +205,15 @@ class ProjectedGPModel(ExactGPModel):
 
         if scalar_B:
             diagonal_B = True
-            self.register_parameter("log_B_tilde", torch.nn.Parameter(np.log(noise_thresh) * torch.ones(n_tasks - n_latents)))
+            self.register_parameter("log_B_tilde", torch.nn.Parameter(np.log(noise_init) * torch.ones(n_tasks - n_latents)))
             torch.nn.utils.parametrize.register_parametrization(self, "log_B_tilde", ScalarParam(bounds=(np.log(noise_thresh), -np.log(noise_thresh))))
             if BDN:
                 self.register_buffer('Y_squared_norm', (train_y**2).sum()) # case of the PLMC_fast (term for MLL computation)
         elif diagonal_B:
-            self.register_parameter("log_B_tilde", torch.nn.Parameter(np.log(noise_thresh)*torch.ones(n_tasks - n_latents)))
+            self.register_parameter("log_B_tilde", torch.nn.Parameter(np.log(noise_init)*torch.ones(n_tasks - n_latents)))
             self.register_constraint("log_B_tilde", gp.constraints.GreaterThan(np.log(noise_thresh)))
         else:
-            self.register_parameter("B_tilde_inv_chol", torch.nn.Parameter(torch.diag_embed(np.log(1/noise_thresh)*torch.ones(n_tasks - n_latents))))
+            self.register_parameter("B_tilde_inv_chol", torch.nn.Parameter(torch.diag_embed(np.log(1/noise_init)*torch.ones(n_tasks - n_latents))))
             torch.nn.utils.parametrize.register_parametrization(self, "B_tilde_inv_chol", LowerTriangularParam(bounds=(np.log(noise_thresh), -np.log(noise_thresh))))
         self.diagonal_B, self.scalar_B = diagonal_B, scalar_B
 
@@ -384,7 +385,7 @@ class ProjectedGPModel(ExactGPModel):
             L = K.cholesky(upper=False)
             loo_var = 1.0 / L._cholesky_solve(identity[None,:], upper=False).diagonal(dim1=-1, dim2=-2)
             loo_delta = L._cholesky_solve(y_proj.unsqueeze(-1), upper=False).squeeze(-1) * loo_var
-            loo_var, loo_delta = loo_var.detach().T, loo_delta.detach().T
+            loo_var, loo_delta = loo_var.T, loo_delta.T
             if not latent:
                 lmc_coeffs = self.lmc_coefficients()
                 e_loo_raw = (loo_delta @ lmc_coeffs)
@@ -415,33 +416,33 @@ class ProjectedGPModel(ExactGPModel):
         self.eval()
         dico = {}
         dico['kernel_type'] = self.covar_module.base_kernel.__class__.__name__ if self.outputscales is None else self.covar_module.__class__.__name__
-        dico['noise_thresh'] = self.likelihood.noise_constraint.lower_bound.item()
-
-        if extra_terms:
-            dico['diagonal_B'] = self.diagonal_B
-            dico['scalar_B'] = self.scalar_B
-            dico['diagonal_R'] = self.diagonal_R
-            Q, R, Q_orth = self.lmc_coefficients.QR()
-            if self.lmc_coefficients.mode == 'Q_plus':
-                dico['Q_orth'] = Q_orth.detach().tolist() 
-            dico['Q'] = Q.detach().tolist()
-            dico['R'] = R.detach().tolist()
-            dico['Sigma_proj'] = self.projected_noise().detach().tolist()
-            if self.diagonal_B:
-                dico['Sigma_orth'] = torch.exp(self.log_B_tilde.detach()).tolist()
-            else:
-                dico['Sigma_orth'] = self.B_tilde_inv_chol.detach().tolist()
-            if hasattr(self, 'M'):
-                dico['M'] = self.M.detach().tolist()
-        else:
-            dico['lmc_coeffs'] = self.lmc_coefficients().detach().tolist()
-
         with torch.no_grad():
-            _ = self(torch.zeros_like(self.train_inputs[0])) # this is to compute the mean cache
-        dico['mean_cache'] = self.prediction_strategy.mean_cache.tolist()
-        dico['lscales'] = self.lscales().tolist()
-        if self.outputscales:
-            dico['outputscales'] = self.outputscales().tolist()
+            if extra_terms:
+                dico['noise_thresh'] = self.likelihood.raw_noise_constraint.lower_bound.item()
+                dico['diagonal_B'] = self.diagonal_B
+                dico['scalar_B'] = self.scalar_B
+                dico['diagonal_R'] = self.diagonal_R
+                Q, R, Q_orth = self.lmc_coefficients.QR()
+                if self.lmc_coefficients.mode == 'Q_plus':
+                    dico['Q_orth'] = Q_orth.tolist() 
+                dico['Q'] = Q.tolist()
+                dico['R'] = R.tolist()
+                dico['Sigma_proj'] = self.projected_noise().tolist()
+                if self.diagonal_B:
+                    dico['Sigma_orth'] = torch.exp(self.log_B_tilde).tolist()
+                else:
+                    dico['Sigma_orth'] = self.B_tilde_inv_chol.tolist()
+                if hasattr(self, 'M'):
+                    dico['M'] = self.M.tolist()
+            else:
+                dico['lmc_coeffs'] = self.lmc_coefficients().tolist()
+
+            with torch.no_grad():
+                _ = self(torch.zeros_like(self.train_inputs[0])) # this is to compute the mean cache
+            dico['mean_cache'] = self.prediction_strategy.mean_cache.tolist()
+            dico['lscales'] = self.lscales().tolist()
+            if self.outputscales:
+                dico['outputscales'] = self.outputscales().tolist()
         return dico
 
 

@@ -157,6 +157,7 @@ def train_model(model_init, X, Y, argus, optimizer=None, compute_loo=False, retu
     stats = {'loss': new_loss, 'n_iter': n_it_eff, 'train_duration': duration}
 
     if compute_loo:
+        devs = devs.cuda() if devs is not None else None
         with torch.no_grad():
             loo_vars, loo_deltas = model.compute_loo(output=output_train)
             loo_duration = time.time() - new_time
@@ -192,12 +193,13 @@ def predict(model, X_test, gpu=False, extra_context_managers={}, return_full_lik
             full_likelihood = model.likelihood
         if gpu:
             X_test = X_test.cuda()
-            Y_test = Y_test.cuda()
             model = model.cuda()
             full_likelihood = full_likelihood.cuda()
             free_mem = torch.cuda.mem_get_info()[0]
             num_bytes = X_test.element_size()
-            n_points, n_tasks = model.train_targets.shape
+            n_tasks = model.n_tasks
+            n_points = len(model.train_inputs[0]) if hasattr(model, 'train_inputs') \
+                else len(model.variational_strategy.base_variational_strategy.inducing_points)
             batch_size = int(free_mem / (16 * n_points * n_tasks * num_bytes)) # à optimiser proprement
             preds, vars = [], [] 
             for i in range(0, len(X_test), batch_size):
@@ -225,6 +227,7 @@ def predict(model, X_test, gpu=False, extra_context_managers={}, return_full_lik
             else:
                 vars_pred = observed_pred.variance
     
+    pred_y, vars_pred = pred_y.squeeze(), vars_pred.squeeze()
     if return_full_lik :
         return pred_y, vars_pred, full_likelihood
     return pred_y, vars_pred
@@ -241,16 +244,19 @@ def eval_model(model, X_test, Y_test, argus, met_dict, extra_context_managers={}
                                                  return_full_lik=True)
     pred_time = time.time() - start
 
+    if argus['gpu']:
+        Y_test = Y_test.cuda()
+        devs = devs.cuda() if devs is not None else None
     ## Computation of some noise terms
     with torch.no_grad():
         global_noise = full_likelihood.noise.squeeze() if hasattr(full_likelihood, 'noise') else 0.
         n_tasks = Y_test.shape[1]
         if hasattr(full_likelihood, 'task_noise_covar_factor'):
             noise_mat_root = full_likelihood.task_noise_covar_factor.squeeze()
-            noise_mat = noise_mat_root.matmul(noise_mat_root.t()) + global_noise * torch.eye(n_tasks)
-            av_noise = torch.linalg.norm(torch.diag(noise_mat)) / n_tasks
+            noise_mat = noise_mat_root.matmul(noise_mat_root.t()) + global_noise * torch.eye(n_tasks, device=noise_mat_root.device)
+            av_noise = torch.diag(noise_mat).mean()
         elif hasattr(full_likelihood, 'task_noises'):
-            av_noise = torch.linalg.norm(full_likelihood.task_noises.squeeze() + global_noise)
+            av_noise = (full_likelihood.task_noises.squeeze() + global_noise).mean()
         else:
             av_noise = global_noise
 
