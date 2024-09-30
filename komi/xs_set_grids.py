@@ -4,6 +4,9 @@ import pandas as pd
 # import h5py
 import copy
 
+
+## Custom data class to store HXS's. Only here for handling grid data in one of the use cases, and for eventual inspiration.
+
 class XsSetGrids:
 
     def __init__( self, multiparam=None, support='grid',
