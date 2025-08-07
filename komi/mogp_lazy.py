@@ -233,7 +233,7 @@ class LazyLMCModel(ExactGPModel):
         # Covar: ... x (N x n_tasks) x (N x n_tasks)
         latent_covar = latent_dist.lazy_covariance_matrix
         lmc_factor = RootLinearOperator(lmc_coefficients.unsqueeze(-1))
-        latent_covar = to_linear_operator(latent_covar.evaluate())
+        # latent_covar = to_linear_operator(latent_covar.evaluate())
         covar = KroneckerProductLinearOperator(latent_covar, lmc_factor).sum(latent_dim)
         covar = covar.add_jitter(self.jitter_val)
 

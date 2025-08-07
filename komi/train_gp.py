@@ -27,6 +27,7 @@ train_context_managers = {
     'ntracesamp':gp.settings.num_trace_samples(10),
     'precondtol':gp.settings.preconditioner_tolerance(1e-3),
     'tridjitter':gp.settings.tridiagonal_jitter(1e-5),
+    'cholmaxtries':gp.settings.cholesky_max_tries(5),
     # 'maxcgiter':gp.settings.max_cg_iterations(5000),
 }
 test_context_managers = {
@@ -145,9 +146,15 @@ def train_model(model_init, X, Y, argus, optimizer=None, compute_loo=False, retu
                     n_it_eff = i
                     break
             elif argus['stopp_crit'] == 'exp':
-                if i > 0 and np.abs(1 - np.exp(new_loss - last_loss)) < argus['loss_thresh']:
-                        n_it_eff = i
-                        break
+                if i > 0:
+                    for j in range(argus['patience'] - 1):
+                        deltas[j+1] = deltas[j]
+                    deltas[0] = np.abs(1 - np.exp(new_loss - last_loss))
+                if i >= argus['patience'] and deltas.mean() < argus['loss_thresh']:
+                    n_it_eff = i
+                    break
+            elif argus['stopp_crit'] == 'none':
+                pass
             else:
                 raise ValueError('Unknown stopping criterion')
             last_loss = new_loss
@@ -181,20 +188,17 @@ def train_model(model_init, X, Y, argus, optimizer=None, compute_loo=False, retu
         return model, stats, optimizer
     return model, stats
 
-def predict(model, X_test, gpu=False, extra_context_managers={}, return_full_lik=False):
+def predict(model, X_test, gpu=False, extra_context_managers={}, compute_var=True):
     context_managers = test_context_managers.copy()
     context_managers.update(extra_context_managers)
     with ExitStack() as stack:
         for _, context in context_managers.items():
             stack.enter_context(context)
-        if hasattr(model, 'full_likelihood'):  # we have to compute the full likelihood of projected models
-            full_likelihood = model.full_likelihood()
-        else:
-            full_likelihood = model.likelihood
         if gpu:
             X_test = X_test.cuda()
             model = model.cuda()
-            full_likelihood = full_likelihood.cuda()
+            if compute_var:
+                full_likelihood = model.full_likelihood() if hasattr(model, 'full_likelihood') else model.likelihood
             free_mem = torch.cuda.mem_get_info()[0]
             num_bytes = X_test.element_size()
             n_tasks = model.n_tasks
@@ -204,36 +208,45 @@ def predict(model, X_test, gpu=False, extra_context_managers={}, return_full_lik
             preds, vars = [], [] 
             for i in range(0, len(X_test), batch_size):
                 x_batch = X_test[i:i+batch_size]
-                observed_pred = full_likelihood(model(x_batch))
+                observed_pred = full_likelihood(model(x_batch)) if compute_var else model(x_batch)
                 pred_y = observed_pred.mean
                 preds.append(pred_y)
-                ## the default variance computaton of the ICM is very memory-intensive. We replace it with our custom formula.
-                ## The function compute_var already operates on batches, so we call it outside the loop.
-                if not (context_managers.get('skip_pred_var', True) and isinstance(model, MultitaskGPModel)): 
-                    vars_pred = observed_pred.variance
-                    vars.append(vars_pred)
+                if compute_var:
+                    ## the default variance computaton of the ICM is very memory-intensive. We replace it with our custom formula.
+                    ## The function compute_var already operates on batches, so we call it outside the loop.
+                    if not (context_managers.get('skip_pred_var', True) and isinstance(model, MultitaskGPModel)): 
+                        vars_pred = observed_pred.variance
+                        vars.append(vars_pred)
             pred_y = torch.cat(preds)
-            if context_managers.get('skip_pred_var', True) and isinstance(model, MultitaskGPModel):
-                vars_pred = model.compute_var(X_test)
-            else:
-                vars_pred = torch.cat(vars)
+            if compute_var:
+                if context_managers.get('skip_pred_var', True) and isinstance(model, MultitaskGPModel):
+                    vars_pred = model.compute_var(X_test)
+                else:
+                    vars_pred = torch.cat(vars)
         else:
             model = model.cpu()
-            full_likelihood = full_likelihood.cpu()
-            observed_pred = full_likelihood(model(X_test))
-            pred_y = observed_pred.mean
-            if context_managers.get('skip_pred_var', True) and isinstance(model, MultitaskGPModel):
-                vars_pred = model.compute_var(X_test)
+            if compute_var:
+                full_likelihood = model.full_likelihood() if hasattr(model, 'full_likelihood') else model.likelihood
+            if compute_var:
+                full_likelihood = full_likelihood.cpu()
+                observed_pred = full_likelihood(model(X_test))
             else:
-                vars_pred = observed_pred.variance
+                observed_pred = model(X_test)
+            pred_y = observed_pred.mean
+            if compute_var:
+                if context_managers.get('skip_pred_var', True) and isinstance(model, MultitaskGPModel):
+                    vars_pred = model.compute_var(X_test)
+                else:
+                    vars_pred = observed_pred.variance
     
-    pred_y, vars_pred = pred_y.squeeze(), vars_pred.squeeze()
-    if return_full_lik :
-        return pred_y, vars_pred, full_likelihood
-    return pred_y, vars_pred
+    pred_y = pred_y.squeeze()
+    vars_pred = vars_pred.squeeze() if compute_var else None
+    full_likelihood = full_likelihood if compute_var else None
+    return pred_y, vars_pred, full_likelihood
 
 
-def eval_model(model, X_test, Y_test, argus, met_dict, extra_context_managers={}, concs=None, devs=None, keys=None, verbose=True):
+def eval_model(model, X_test, Y_test, argus, met_dict, extra_context_managers={}, concs=None, devs=None, keys=None,
+               compute_var=True, verbose=True):
     model = load_model(model)
     model.eval()
     start = time.time()
@@ -241,26 +254,31 @@ def eval_model(model, X_test, Y_test, argus, met_dict, extra_context_managers={}
         print(' \n Making predictions...')
 
     pred_y, vars_pred, full_likelihood = predict(model, X_test, gpu=argus['gpu'], extra_context_managers=extra_context_managers,
-                                                 return_full_lik=True)
+                                                 compute_var=compute_var)
     pred_time = time.time() - start
 
     if argus['gpu']:
         Y_test = Y_test.cuda()
         devs = devs.cuda() if devs is not None else None
     ## Computation of some noise terms
-    with torch.no_grad():
-        global_noise = full_likelihood.noise.squeeze() if hasattr(full_likelihood, 'noise') else 0.
-        n_tasks = Y_test.shape[1]
-        if hasattr(full_likelihood, 'task_noise_covar_factor'):
-            noise_mat_root = full_likelihood.task_noise_covar_factor.squeeze()
-            noise_mat = noise_mat_root.matmul(noise_mat_root.t()) + global_noise * torch.eye(n_tasks, device=noise_mat_root.device)
-            av_noise = torch.diag(noise_mat).mean()
-        elif hasattr(full_likelihood, 'task_noises'):
-            av_noise = (full_likelihood.task_noises.squeeze() + global_noise).mean()
-        else:
-            av_noise = global_noise
+    if compute_var:
+        with torch.no_grad():
+            global_noise = full_likelihood.noise.squeeze() if hasattr(full_likelihood, 'noise') else 0.
+            n_tasks = Y_test.shape[1]
+            if hasattr(full_likelihood, 'task_noise_covar_factor'):
+                noise_mat_root = full_likelihood.task_noise_covar_factor.squeeze()
+                noise_mat = noise_mat_root.matmul(noise_mat_root.t()) + global_noise * torch.eye(n_tasks, device=noise_mat_root.device)
+                av_noise = torch.diag(noise_mat).mean()
+            elif hasattr(full_likelihood, 'task_noises'):
+                av_noise = (full_likelihood.task_noises.squeeze() + global_noise).mean()
+            else:
+                av_noise = global_noise
+        av_noise = av_noise.cpu().numpy()
+    else:
+        av_noise = None
+        vars_pred = torch.ones((1,1))
 
-    metrics = {'pred_time': pred_time, 'noise': av_noise.cpu().numpy()}
+    metrics = {'pred_time': pred_time, 'noise': av_noise}
     deltas = Y_test - pred_y
     sigmas_pred = vars_pred.sqrt()
     raw_metrics = {'y_test':Y_test, 'deltas':deltas, 'errs':torch.abs(deltas), 'errs2':deltas**2, 
