@@ -198,7 +198,7 @@ def predict(model, X_test, gpu=False, extra_context_managers={}, compute_var=Tru
             X_test = X_test.cuda()
             model = model.cuda()
             if compute_var:
-                full_likelihood = model.full_likelihood() if hasattr(model, 'full_likelihood') else model.likelihood
+                full_likelihood = model.full_likelihood(diag=True) if hasattr(model, 'full_likelihood') else model.likelihood
             free_mem = torch.cuda.mem_get_info()[0]
             num_bytes = X_test.element_size()
             n_tasks = model.n_tasks
@@ -275,7 +275,7 @@ def eval_model(model, X_test, Y_test, argus, met_dict, extra_context_managers={}
                 av_noise = global_noise
         av_noise = av_noise.cpu().numpy()
     else:
-        av_noise = None
+        av_noise = 0.
         vars_pred = torch.ones((1,1))
 
     metrics = {'pred_time': pred_time, 'noise': av_noise}

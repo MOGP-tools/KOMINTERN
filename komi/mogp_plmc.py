@@ -268,18 +268,15 @@ class ProjectedGPModel(ExactGPModel):
         else:
             return Hpinv_times_Y # shape n_latents x n_points ; opposite convention to most other quantities !!
 
-    def full_likelihood( self ) -> gp.likelihoods.MultitaskGaussianLikelihood:
+    def full_likelihood( self, diag=False ) -> gp.likelihoods.MultitaskGaussianLikelihood:
         """
         Outputs the task-level likelihood of the model (Sigma matrix from the reference article), including the noise of the latent processes and the discarded noise.
         Returns:
             Task-level likelihood of the model, with a multitask gaussian likelihood of size n_tasks.
         """
         Q, R, Q_orth = self.lmc_coefficients.QR()
-        res = gp.likelihoods.MultitaskGaussianLikelihood(num_tasks=self.n_tasks, rank=self.n_tasks, has_global_noise=False)
         QR = Q @ R
         sigma_p = self.projected_noise()
-        if sigma_p.is_cuda:
-            res.cuda()
         if hasattr(self, "M"):
             if self.diagonal_B:
                 B_tilde_root = torch.diag_embed(torch.exp(self.log_B_tilde / 2))
@@ -295,7 +292,10 @@ class ProjectedGPModel(ExactGPModel):
         else:
             if self.scalar_B:
                 if self.log_B_tilde.numel() > 0:
-                    B_term = torch.exp(self.log_B_tilde[0]) * (torch.eye(self.n_tasks, device=self.log_B_tilde.device) - Q @ Q.T)
+                    if diag:
+                        B_term = torch.exp(self.log_B_tilde[0]) * (1 - (Q**2).sum(dim=1))
+                    else:
+                        B_term = torch.exp(self.log_B_tilde[0]) * (torch.eye(self.n_tasks, device=self.log_B_tilde.device) - Q @ Q.T)
                 else:
                     B_term = 0.
             else:
@@ -305,25 +305,33 @@ class ProjectedGPModel(ExactGPModel):
                     B_tilde_root = torch.linalg.solve_triangular(self.B_tilde_inv_chol,
                         torch.eye(self.n_tasks - self.n_latents, device=self.B_tilde_inv_chol.device), upper=False).T
                 B_term_root = Q_orth @ B_tilde_root
-                B_term = B_term_root @ B_term_root.T
+                B_term = B_term_root @ B_term_root.T if not diag else (B_term_root**2).sum(dim=1)
             M_term, Mt_term = 0., 0.
             D_term_root = QR * torch.sqrt(sigma_p)[None,:]
-            D_term = D_term_root @ D_term_root.T
+            D_term = D_term_root @ D_term_root.T if not diag else (D_term_root**2).sum(dim=1)
 
-        Sigma = D_term + M_term + Mt_term + B_term
-        # We use a while loop to ensure that the full noise covariance is positive definite.
-        # We can deactivate gradient computation as loss computation does not involve the full likelihood
-        with torch.no_grad(): 
-            eps = self.jitter_val
-            while eps < 1e6 * self.jitter_val:
-                try:
-                    identity = torch.eye(self.n_tasks, dtype=res.task_noise_covar.dtype, device=res.task_noise_covar.device)
-                    res.task_noise_covar_factor.data = torch.linalg.cholesky(Sigma + eps*identity)
-                    break
-                except:
-                    eps *= 10
-                    warnings.warn("Cholesky of the full noise covariance failed. Trying again with jitter {0} ...".format(eps))
-
+        if diag:
+            res = gp.likelihoods.MultitaskGaussianLikelihood(num_tasks=self.n_tasks, rank=0, has_global_noise=False)
+            if sigma_p.is_cuda:
+                res.cuda()
+            res.task_noises = B_term + D_term
+        else:
+            res = gp.likelihoods.MultitaskGaussianLikelihood(num_tasks=self.n_tasks, rank=self.n_tasks, has_global_noise=False)
+            if sigma_p.is_cuda:
+                res.cuda()
+            Sigma = D_term + M_term + Mt_term + B_term
+            # We use a while loop to ensure that the full noise covariance is positive definite.
+            # We can deactivate gradient computation as loss computation does not involve the full likelihood
+            with torch.no_grad(): 
+                eps = self.jitter_val
+                while eps < 1e6 * self.jitter_val:
+                    try:
+                        identity = torch.eye(self.n_tasks, dtype=res.task_noise_covar.dtype, device=res.task_noise_covar.device)
+                        res.task_noise_covar_factor.data = torch.linalg.cholesky(Sigma + eps*identity)
+                        break
+                    except:
+                        eps *= 10
+                        warnings.warn("Cholesky of the full noise covariance failed. Trying again with jitter {0} ...".format(eps))
         return res
 
     def B_tilde( self )-> Tensor:
