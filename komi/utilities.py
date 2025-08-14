@@ -1,4 +1,4 @@
-from typing import Union, List
+from typing import Union, List, Tuple
 import math
 import numpy as np
 import torch
@@ -195,7 +195,7 @@ class LeaveOneOutPseudoLikelihood(gp.mlls.exact_marginal_log_likelihood.ExactMar
     
 ## Model definition and initialization
     
-def handle_covar_( kernel: Kernel, dim: int, decomp: Union[List[List[int]], None]=None, n_funcs:int=1,
+def handle_covar_( kernel: Kernel, dim: int, decomp: Union[List[List[int]], None, dict]=None, n_funcs:int=1,
                    prior_scales:Union[Tensor,None]=None, prior_width:Union[Tensor,None]=None, outputscales:bool=True,
                    ker_kwargs:Union[dict, None]=None )-> Kernel:
 
@@ -221,6 +221,14 @@ def handle_covar_( kernel: Kernel, dim: int, decomp: Union[List[List[int]], None
 
     if decomp is None:
         decomp = [list(range(dim))]
+    if isinstance(decomp, dict):
+        if not ('cont' in decomp and 'disc' in decomp):
+            raise KeyError('Invalid format for variable grouping : {0}'.format(decomp))
+        else:
+            disc_vars = decomp['disc']
+            decomp = decomp['cont']
+    else:
+        disc_vars = []
 
     l_priors = [None] * len(decomp)
     if prior_scales is not None:
@@ -256,6 +264,9 @@ def handle_covar_( kernel: Kernel, dim: int, decomp: Union[List[List[int]], None
             covar_module = gp.kernels.ScaleKernel(kernels[0], batch_shape=torch.Size([n_funcs]))
         else:
             covar_module = kernels[0]
+    
+    for i_disc, n_vals, rank in disc_vars:
+        covar_module *= gp.kernels.IndexKernel(num_tasks=n_vals, active_dims=i_disc, rank=rank)
 
     if prior_scales is not None and kernels[0].has_lengthscale:
         try:
