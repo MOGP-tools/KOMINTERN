@@ -216,7 +216,7 @@ class MultitaskGPModel(ExactGPModel):
         C = ker_op.linear_ops[i_task]
         C_tilde = noise_inv_root.matmul(C.matmul(noise_inv_root))
         C_evals, C_evecs = C_tilde._symeig(eigenvectors=True)
-        C_hat = C.matmul(noise_inv_root).matmul(C_evecs).evaluate().squeeze()
+        C_hat = C.matmul(noise_inv_root).matmul(C_evecs).to_dense().squeeze()
         C_square = C_hat**2
 
         S = torch.kron(k_evals, C_evals) + 1.0
@@ -231,7 +231,7 @@ class MultitaskGPModel(ExactGPModel):
         second_term_results = []  # List to store the results
         for i in range(0, n, batch_size):
             x_batch = x[i:i+batch_size]
-            k_hat = self.covar_module.data_covar_module(x_batch, x_train).matmul(k_evecs).evaluate().squeeze()
+            k_hat = self.covar_module.data_covar_module(x_batch, x_train).matmul(k_evecs).to_dense().squeeze()
             k_square = k_hat**2
             second_term = torch.kron(k_square, C_square) @ S.pow(-1).squeeze()
             second_term_results.append(second_term.reshape((len(x_batch), self.n_tasks)))
@@ -265,7 +265,7 @@ class MultitaskGPModel(ExactGPModel):
             The condition number of the training data kernel matrix
         """
         with torch.no_grad():
-            K = self.covar_module.data_covar_module(self.train_inputs[0]).evaluate()
+            K = self.covar_module.data_covar_module(self.train_inputs[0]).to_dense()
             K_plus_noise = K  + torch.eye(len(self.train_inputs[0]), device=self.train_inputs[0].device)
             # In the efficient implementation of the ICM, used in particular in gpytorch, the noise "seen" by the data kernel is always 1.
             # The amplitude of this noise is reported onto the task kernel instead.
