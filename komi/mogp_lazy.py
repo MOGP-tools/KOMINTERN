@@ -93,7 +93,7 @@ class LazyLMCModel(ExactGPModel):
         else:
             return (data @ self.projection_matrix()).T # shape n_latents x n_points ; opposite convention to most other quantities !!
 
-    def full_likelihood( self ) -> Likelihood :
+    def full_likelihood( self, **kwargs ) -> Likelihood :
         """
         Returns the full likelihood of the model, which is a multitask Gaussian likelihood.
         Returns:
