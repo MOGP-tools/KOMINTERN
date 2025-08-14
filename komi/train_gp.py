@@ -191,6 +191,8 @@ def train_model(model_init, X, Y, argus, optimizer=None, compute_loo=False, retu
 def predict(model, X_test, gpu=False, extra_context_managers={}, compute_var=True):
     context_managers = test_context_managers.copy()
     context_managers.update(extra_context_managers)
+    skip_pred_var = isinstance(model, MultitaskGPModel) or not compute_var
+    context_managers.update({'skip_pred_var':gp.settings.skip_posterior_variances(state=skip_pred_var)})
     with ExitStack() as stack:
         for _, context in context_managers.items():
             stack.enter_context(context)
@@ -214,12 +216,12 @@ def predict(model, X_test, gpu=False, extra_context_managers={}, compute_var=Tru
                 if compute_var:
                     ## the default variance computaton of the ICM is very memory-intensive. We replace it with our custom formula.
                     ## The function compute_var already operates on batches, so we call it outside the loop.
-                    if not (context_managers.get('skip_pred_var', True) and isinstance(model, MultitaskGPModel)): 
+                    if not isinstance(model, MultitaskGPModel): 
                         vars_pred = observed_pred.variance
                         vars.append(vars_pred)
             pred_y = torch.cat(preds)
             if compute_var:
-                if context_managers.get('skip_pred_var', True) and isinstance(model, MultitaskGPModel):
+                if isinstance(model, MultitaskGPModel):
                     vars_pred = model.compute_var(X_test)
                 else:
                     vars_pred = torch.cat(vars)
@@ -227,14 +229,13 @@ def predict(model, X_test, gpu=False, extra_context_managers={}, compute_var=Tru
             model = model.cpu()
             if compute_var:
                 full_likelihood = model.full_likelihood() if hasattr(model, 'full_likelihood') else model.likelihood
-            if compute_var:
                 full_likelihood = full_likelihood.cpu()
                 observed_pred = full_likelihood(model(X_test))
             else:
                 observed_pred = model(X_test)
             pred_y = observed_pred.mean
             if compute_var:
-                if context_managers.get('skip_pred_var', True) and isinstance(model, MultitaskGPModel):
+                if isinstance(model, MultitaskGPModel):
                     vars_pred = model.compute_var(X_test)
                 else:
                     vars_pred = observed_pred.variance
