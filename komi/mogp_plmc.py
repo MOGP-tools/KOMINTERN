@@ -20,7 +20,7 @@ class LMCMixingMatrix(torch.nn.Module):
     Class for the parametrized mixing matrix of projected models. Making it a separate class allows to call 
     torch.nn.utils.parametrizations.orthogonal onto it during instanciation of a ProjectedGPModel
     """
-    def __init__( self, Q_plus:Tensor, R:Tensor, bulk:bool=True ):
+    def __init__( self, Q_plus:Tensor, R:Tensor, bulk:bool=True, diagonal_R=False):
         """
 
         Args:
@@ -45,6 +45,7 @@ class LMCMixingMatrix(torch.nn.Module):
         self.n_tasks = Q_plus.shape[0]
         self._size = torch.Size([self.n_latents, self.n_tasks])
         self.bulk = bulk
+        self.diagonal_R = diagonal_R
         if bulk:
             if self.mode=='Q_plus':
                 R_padded = torch.eye(self.n_tasks)
@@ -94,6 +95,8 @@ class LMCMixingMatrix(torch.nn.Module):
                 Q, Q_orth, R = Q_plus, None, R_padded
         else:
             Q, Q_orth, R = self.Q(), self.Q_orth(), self.R
+        if self.diagonal_R:
+            R = torch.diag_embed(torch.diag(R))
         return Q, R, Q_orth
 
     def forward( self ) -> Tensor:
@@ -103,6 +106,9 @@ class LMCMixingMatrix(torch.nn.Module):
             Transposed mixing matrix H, of shape n_tasks x n_latents.
         """
         if self.bulk:
+            if self.diagonal_R:
+                Q, R, Q_orth = self.QR()
+                return (Q @ torch.diag_embed(torch.diag(R))).T
             if self.mode == 'Q':
                 return self.H.T
             else:
@@ -193,8 +199,8 @@ class ProjectedGPModel(ExactGPModel):
                 R = R_padded[:n_latents]
 
         R = torch.diag_embed(R)
-        lmc_coefficients = LMCMixingMatrix(Q_plus, R, bulk=bulk)
-        if diagonal_R or not bulk:
+        lmc_coefficients = LMCMixingMatrix(Q_plus, R, bulk=bulk, diagonal_R=diagonal_R)
+        if not bulk:
             lmc_coefficients = torch.nn.utils.parametrizations.orthogonal(lmc_coefficients, name="Q_plus", orthogonal_map=ortho_param,
                                                                         use_trivialization=(ortho_param!='householder'))  # parametrizes Q_plus as orthogonal
             if diagonal_R:
