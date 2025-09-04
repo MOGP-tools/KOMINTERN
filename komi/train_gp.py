@@ -286,6 +286,9 @@ def eval_model(model, X_test, Y_test, argus, met_dict, extra_context_managers={}
                    'sigmas':sigmas_pred, 'vars':vars_pred, 'concs':concs, 'keys':keys}
     if devs is not None:
         raw_metrics['u_errs'] = devs * raw_metrics['errs']
+        raw_metrics['devs'] = devs
+    else:
+        raw_metrics['devs'] = torch.std(Y_test, dim=0)
     for met in met_dict:
         metrics[met] = met_dict[met](raw_metrics).cpu().numpy()
     return pred_y, sigmas_pred, metrics
