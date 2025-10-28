@@ -564,15 +564,12 @@ class ProjectedLMCmll(gp.mlls.ExactMarginalLogLikelihood):
         else:
             if self.model.diagonal_B:
                 log_B_tilde_root_diag = self.model.log_B_tilde / 2
-                B_tilde_inv = torch.diag_embed(torch.exp(- self.model.log_B_tilde))
-                rot_proj_target = target @ Q_orth
-                discarded_noise_term = rot_proj_target @ B_tilde_inv @ rot_proj_target.T
+                rot_proj_scaled_target = target @ Q_orth * torch.exp(- log_B_tilde_root_diag)
             else:
                 B_tilde_inv_root_diag = self.model.B_tilde_inv_chol[range(p-q), range(p-q)]
                 log_B_tilde_root_diag = -torch.log(B_tilde_inv_root_diag)
-                discarded_noise_root = target @ Q_orth @ self.model.B_tilde_inv_chol
-                discarded_noise_term = discarded_noise_root @ discarded_noise_root.T
-            self.proj_term_list[1] = - 0.5 * torch.trace(discarded_noise_term).div_(num_data)
+                rot_proj_scaled_target = target @ Q_orth @ self.model.B_tilde_inv_chol
+            self.proj_term_list[1] = - 0.5 * (rot_proj_scaled_target**2).sum().div_(num_data)
 
         # All terms are implicitly or explicitly divided by the number of datapoints
         self.proj_term_list[0] = - 0.5 * 2 * torch.sum(log_B_tilde_root_diag) # factor 2 because of the use of a root
