@@ -57,9 +57,56 @@ def i_tofloat(x):
         return x.float()
     else:
         return x.astype(float)
+    
+def truncated_exponential(x, k):
+    """
+    Compute the exponential function truncated at order k.
+    
+    Parameters:
+    x (float): Input value
+    k (int): Truncation order
+    
+    Returns:
+    float: Approximation of exp(x) truncated at order k
+    """
+    total = 0.0
+    term = 1.0  # Start with the 0th term (x^0/0! = 1)
+    
+    for i in range(k + 1):
+        total += term
+        if i < k:
+            term *= x / (i + 1)  # Compute next term using previous term
+    
+    return total
 ##----------------------------------------------------------------------------------------------------------------------
 
 ## Custom means and kernels
+
+class TruncatedRBFCovariance(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x1, x2, lengthscale, order, sq_dist_func):
+        if any(ctx.needs_input_grad[:2]):
+            raise RuntimeError("RBFCovariance cannot compute gradients with " "respect to x1 and x2")
+        if lengthscale.size(-1) > 1:
+            raise ValueError("RBFCovariance cannot handle multiple lengthscales")
+        needs_grad = any(ctx.needs_input_grad)
+        x1_ = x1.div(lengthscale)
+        x2_ = x2.div(lengthscale)
+        unitless_sq_dist = sq_dist_func(x1_, x2_)
+        # clone because inplace operations will mess with what's saved for backward
+        unitless_sq_dist_ = unitless_sq_dist.clone() if needs_grad else unitless_sq_dist
+        covar_mat = truncated_exponential(unitless_sq_dist_.div_(-2.0), k=order)
+        if needs_grad:
+            d_output_d_input = unitless_sq_dist.mul_(covar_mat).div_(lengthscale)
+            ctx.save_for_backward(d_output_d_input)
+        return covar_mat
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        d_output_d_input = ctx.saved_tensors[0]
+        lengthscale_grad = grad_output * d_output_d_input
+        return None, None, lengthscale_grad, None
+    
 
 class SplineKernel(gp.kernels.Kernel):
     is_stationary = False
