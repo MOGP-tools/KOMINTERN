@@ -313,7 +313,7 @@ def handle_covar_( kernel: Kernel, dim: int, decomp: Union[List[List[int]], None
             covar_module = kernels[0]
     
     for i_disc, n_vals, rank in disc_vars:
-        covar_module *= gp.kernels.IndexKernel(num_tasks=n_vals, active_dims=i_disc, rank=rank)
+        covar_module *= gp.kernels.IndexKernel(num_tasks=n_vals, active_dims=i_disc, rank=rank, batch_shape=torch.Size([n_funcs]))
 
     if prior_scales is not None and kernels[0].has_lengthscale:
         try:
