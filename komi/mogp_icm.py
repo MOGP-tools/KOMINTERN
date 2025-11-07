@@ -8,10 +8,11 @@ import torch
 from torch import Tensor
 import gpytorch as gp
 from gpytorch.likelihoods.likelihood import Likelihood
-from linear_operator.operators import PsdSumLinearOperator
+from linear_operator.operators import PsdSumLinearOperator, RootLinearOperator
 
 from .utilities import init_lmc_coefficients
 from .base_gp import ExactGPModel
+from .lowrank_multitask_kernel import LowrankMultitaskKernel
 
 class MultitaskGPModel(ExactGPModel):
     """
@@ -28,6 +29,7 @@ class MultitaskGPModel(ExactGPModel):
                   init_lmc_coeffs:bool=True,
                   outputscales:bool=False,
                   model_type:str='ICM',
+                  lowrank:bool=False,
                   **kwargs):
         """Initialization of the model. Note that the optional arguments of the ExactGPModel (in particular the choice of 
         mean and kernel function) also apply here thanks to the inheritance.
@@ -46,6 +48,7 @@ class MultitaskGPModel(ExactGPModel):
             scaling, and may result in over-parametrization. Defaults to False
             model_type: choice between 'ICM' and 'LMC'. The latter is very computationnally-heavy and unstable, so it should only be used for very specific
             experimental purposes. Defaults to "ICM"
+            lowrank: If True, the cross-task covariance matrix is low-rank. Defaults to False
         """
         n_data, n_tasks = train_y.shape
         noise_init = 10 * noise_thresh
@@ -60,7 +63,10 @@ class MultitaskGPModel(ExactGPModel):
         self.mean_module = gp.means.MultitaskMean(self.mean_module, num_tasks=n_tasks)
         
         if model_type=='ICM':
-            self.covar_module = gp.kernels.MultitaskKernel(self.covar_module, num_tasks=n_tasks, rank=n_latents)
+            if lowrank:
+                self.covar_module = LowrankMultitaskKernel(self.covar_module, num_tasks=n_tasks, rank=n_latents)
+            else:
+                self.covar_module = gp.kernels.MultitaskKernel(self.covar_module, num_tasks=n_tasks, rank=n_latents)
         elif model_type=='LMC':
             self.covar_module = gp.kernels.LCMKernel(base_kernels=[copy.deepcopy(self.covar_module) for i in range(n_latents)],
                                                            num_tasks=n_tasks, rank=1)
@@ -207,7 +213,7 @@ class MultitaskGPModel(ExactGPModel):
         x_train = self.train_inputs[0]
         ker_op = self.covar_module.forward(x_train,x_train)
         noise_op = self.likelihood._shaped_noise_covar((len(x_train), len(x_train)), add_noise=True)
-        i_task = 1 if isinstance(ker_op.linear_ops[1], PsdSumLinearOperator) else 0
+        i_task = 1 if isinstance(ker_op.linear_ops[1], (PsdSumLinearOperator, RootLinearOperator)) else 0 #TODO : clean this
 
         data_ker = ker_op.linear_ops[(i_task + 1) % 2]
         k_evals, k_evecs = data_ker._symeig(eigenvectors=True)
