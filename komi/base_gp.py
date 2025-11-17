@@ -25,6 +25,7 @@ class ExactGPModel(gp.models.ExactGP):
                   kernel_type:Kernel=gp.kernels.RBFKernel,
                   mean_type:Mean=gp.means.ConstantMean,
                   decomp:Union[List[List[int]], None]=None,
+                  disc_ranks:Tuple[int,...]=(),
                   outputscales:bool=False,
                   noise_thresh:float=1e-6,
                   n_inducing_points:Union[int,None]=None,
@@ -43,6 +44,8 @@ class ExactGPModel(gp.models.ExactGP):
             kernel_type: . gp kernel function for latent processes. Defaults to gp.kernels.RBFKernel.
             mean_type: gp mean function for the outputs. Defaults to gp.means.ConstantMean.
             decomp: instructions to create a composite kernel with subgroups of variables. Ex : decomp = [[0,1],[1,2]] --> k(x0,x1,x2) = k1(x0,x1) + k2(x1,x2). Defaults to None.
+            disc_ranks: optional tuple of integers indicating the correlation rank of each discrete kernel.
+            | Used (and required) only if decomp contains a non-empty 'cont' entry (continuous variables)
             outputscales: whether to endow the kernel with a learned scaling factor, k(.) = a*k_base(.). Defaults to True
             noise_thresh: minimum value for the noise parameter. Has a large impact for ill-conditioned kernel matrices, which is the case of the HXS application. Defaults to 1e-6.
             n_inducing_points: if an integer is provided, the model will use the sparse GP approximation of Titsias (2009) with this many inducing points. Defaults to None.
@@ -75,8 +78,8 @@ class ExactGPModel(gp.models.ExactGP):
         self.n_tasks = n_tasks
         self.batch_lik = isinstance(likelihood, gp.likelihoods.GaussianLikelihood)
         self.mean_module = mean_type(input_size=self.dim, batch_shape=torch.Size([n_tasks]))
-        self.covar_module = handle_covar_(kernel_type, dim=self.dim, decomp=decomp, prior_scales=prior_scales,
-                                          prior_width=prior_width, outputscales=outputscales,
+        self.covar_module = handle_covar_(kernel_type, dim=self.dim, decomp=decomp, disc_ranks=disc_ranks,
+                                          prior_scales=prior_scales, prior_width=prior_width, outputscales=outputscales,
                                           n_funcs=n_tasks, ker_kwargs=ker_kwargs)
         if n_inducing_points is not None:
             self.covar_module = gp.kernels.InducingPointKernel(self.covar_module, torch.randn(n_inducing_points, self.dim), likelihood)

@@ -1,10 +1,12 @@
 from typing import Union, List, Tuple
 import math
+from gpytorch.constraints import Interval
 import numpy as np
 import torch
 from torch import Tensor
 import gpytorch as gp
 from gpytorch.kernels.kernel import Kernel
+from gpytorch.kernels.rq_kernel import RQKernel
 from sklearn.utils.extmath import randomized_svd
 
 ##----------------------------------------------------------------------------------------------------------------------
@@ -123,6 +125,12 @@ class SplineKernel(gp.kernels.Kernel):
             batch_dim = -1 if params.get("last_dim_is_batch", False) else 0
             res = res.unsqueeze(batch_dim).expand(*self.batch_shape, *res.shape)
         return res
+
+class FixedRQKernel(RQKernel):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.raw_alpha.requires_grad = False
+        self.alpha = 8
 
 class PolynomialMean(gp.means.mean.Mean):
     def __init__( self, input_size, batch_shape=torch.Size(), bias=True, degree=3):
@@ -244,7 +252,7 @@ class LeaveOneOutPseudoLikelihood(gp.mlls.exact_marginal_log_likelihood.ExactMar
     
 def handle_covar_( kernel: Kernel, dim: int, decomp: Union[List[List[int]], None, dict]=None, n_funcs:int=1,
                    prior_scales:Union[Tensor,None]=None, prior_width:Union[Tensor,None]=None, outputscales:bool=True,
-                   ker_kwargs:Union[dict, None]=None )-> Kernel:
+                   disc_ranks:Tuple[int,...]=(), ker_kwargs:Union[dict, None]=None )-> Kernel:
 
     """ An utilitary to create and initialize covariance functions.
 
@@ -252,12 +260,14 @@ def handle_covar_( kernel: Kernel, dim: int, decomp: Union[List[List[int]], None
         kernel: basis kernel type
         dim: dimension of the data (number of variables)
         decomp: instructions to create a composite kernel with subgroups of variables. Defaults to None
-        Ex : decomp = [[0,1],[1,2]] --> k(x0,x1,x2) = k1(x0,x1) + k2(x1,x2)
+        | Ex : decomp = [[0,1],[1,2]] --> k(x0,x1,x2) = k1(x0,x1) + k2(x1,x2)
         n_funcs: batch dimension (number of tasks or latent functions depending on the case), defaults to 1
         prior_scales: mean values of the prior for characteristic lengthscales. Defaults to None
         prior_width: deviation_to_mean ratio of the prior for characteristic lengthscales. Defaults to None
         outputscales: whether or not the full kernel has a learned scaling factor, i.e k(x) = a* k'(x). 
-        If decomp is nontrivial, each subkernel is automatically granted an outputscale. Defaults to True
+        | If decomp is nontrivial, each subkernel is automatically granted an outputscale. Defaults to True
+        disc_ranks: optional tuple of integers indicating the correlation rank of each discrete kernel.
+        | Used (and required) only if decomp contains a non-empty 'cont' entry (continuous variables)
         ker_kwargs: additional arguments to pass to the underlying gp kernel. Defaults to None
 
     Returns:
@@ -274,6 +284,9 @@ def handle_covar_( kernel: Kernel, dim: int, decomp: Union[List[List[int]], None
         else:
             disc_vars = decomp['disc']
             decomp = decomp['cont']
+            if len(disc_vars) != len(disc_ranks):
+                raise(ValueError('Provided decomposition contains {0} discrete variables, but {1} ' \
+                'discrete correlation ranks were specified'.format(len(disc_vars), len(disc_ranks))))
     else:
         disc_vars = []
 
@@ -312,8 +325,9 @@ def handle_covar_( kernel: Kernel, dim: int, decomp: Union[List[List[int]], None
         else:
             covar_module = kernels[0]
     
-    for i_disc, n_vals, rank in disc_vars:
-        covar_module *= gp.kernels.IndexKernel(num_tasks=n_vals, active_dims=i_disc, rank=rank, batch_shape=torch.Size([n_funcs]))
+    for i_disc, el in enumerate(disc_vars):
+        var_location, n_vals = el
+        covar_module *= gp.kernels.IndexKernel(num_tasks=n_vals, active_dims=var_location, rank=disc_ranks[i_disc], batch_shape=torch.Size([n_funcs]))
 
     if prior_scales is not None and kernels[0].has_lengthscale:
         try:

@@ -1,5 +1,5 @@
 from functools import reduce #, lru_cache
-from typing import Union, List
+from typing import Union, List, Tuple
 import warnings
 import numpy as np
 import torch
@@ -53,6 +53,7 @@ class VariationalMultitaskGPModel(gp.models.ApproximateGP):
                  kernel_type:Kernel=gp.kernels.RBFKernel,
                  mean_type:Mean=gp.means.ConstantMean,
                  decomp:Union[List[List[int]],None]=None,
+                 disc_ranks:Tuple[int,...]=(),
                  distrib:gp.variational._VariationalDistribution=gp.variational.CholeskyVariationalDistribution, 
                  var_strat:gp.variational._VariationalStrategy=gp.variational.VariationalStrategy,
                  init_lmc_coeffs:bool=True,
@@ -75,6 +76,8 @@ class VariationalMultitaskGPModel(gp.models.ApproximateGP):
             kernel_type: gpytorch kernel function for the latent processes. Defaults to gp.kernels.RBFKernel.
             mean_type: gpytorch mean function for the outputs. Defaults to gp.means.ConstantMean.
             decomp: instructions to create a composite kernel with subgroups of variables. Ex : decomp = [[0,1],[1,2]] --> k(x0,x1,x2) = k1(x0,x1) + k2(x1,x2). Defaults to None.
+            disc_ranks: optional tuple of integers indicating the correlation rank of each discrete kernel.
+            | Used (and required) only if decomp contains a non-empty 'cont' entry (continuous variables)
             distrib: gpytorch variational distribution for inducing values (see gpytorch documentation). Defaults to gp.variational.CholeskyVariationalDistribution.
             var_strat: gpytorch variational strategy (see gpytorch documentation). Defaults to gp.variational.VariationalStrategy.
             init_lmc_coeffs: whether to initialize LMC coefficients with SVD of the training labels. If False, these coefficients are sampled from a normal distribution. Defaults to True.
@@ -127,7 +130,7 @@ class VariationalMultitaskGPModel(gp.models.ApproximateGP):
 
         super().__init__(variational_strategy)
 
-        self.covar_module = handle_covar_(kernel_type, dim=self.dim, decomp=decomp, prior_scales=prior_scales,
+        self.covar_module = handle_covar_(kernel_type, dim=self.dim, decomp=decomp, disc_ranks=disc_ranks, prior_scales=prior_scales,
                                             prior_width=prior_width, n_funcs=n_latents, ker_kwargs=ker_kwargs, outputscales=outputscales)
         self.mean_module = gp.means.ZeroMean(batch_shape=torch.Size([n_latents])) #in gp, latent processes can have non-zero means, which we wish to avoid
 
