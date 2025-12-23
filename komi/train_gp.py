@@ -264,12 +264,19 @@ def eval_model(model, X_test, Y_test, argus, met_dict, extra_context_managers={}
     ## Computation of some noise terms
     if compute_var:
         with torch.no_grad():
-            global_noise = full_likelihood.noise if hasattr(full_likelihood, 'noise') else 0.
-            n_tasks = Y_test.shape[1]
+            if hasattr(full_likelihood, 'noise'):
+                global_noise = full_likelihood.noise.squeeze()
+                for dim in model.shape_batch:
+                    global_noise = global_noise.unsqueeze(-1)
+            else:
+                global_noise = torch.zeros(torch.Size([*model.shape_batch, 1]))
+            n_tasks = Y_test.shape[-1]
             if hasattr(full_likelihood, 'task_noise_covar_factor'):
                 noise_mat_root = full_likelihood.task_noise_covar_factor
-                noise_mat = noise_mat_root.matmul(noise_mat_root.t()) + global_noise * torch.eye(n_tasks, device=noise_mat_root.device)
-                av_noise = torch.diag(noise_mat).mean()
+                noise_mat = noise_mat_root @ noise_mat_root.mT
+                noise_mat += global_noise.unsqueeze(-1) * torch.broadcast_to(
+                    torch.eye(n_tasks, device=noise_mat_root.device), noise_mat.shape) 
+                av_noise = torch.diagonal(noise_mat, dim1=-2, dim2=-1).mean()
             elif hasattr(full_likelihood, 'task_noises'):
                 task_noises = full_likelihood.task_noises
                 av_noise = (task_noises + torch.broadcast_to(global_noise, task_noises.shape)).mean()

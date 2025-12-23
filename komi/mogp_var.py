@@ -104,7 +104,7 @@ class VariationalMultitaskGPModel(gp.models.ApproximateGP):
             axes_layout = {'n_batch':0, 'n_points':1, 'n_tasks':2}
             latent_batch_shape = torch.Size([n_batch, n_latents])
             output_batch_shape = torch.Size([n_batch, n_tasks])
-            multilik_batch_shape = torch.Size([n_tasks])
+            multilik_batch_shape = torch.Size([n_batch])
 
         if float(train_ind_ratio) == 1.:
             warnings.warn('Caution : inducing points not learned !')
@@ -140,20 +140,22 @@ class VariationalMultitaskGPModel(gp.models.ApproximateGP):
         if likelihood is None:
             noise_init = 10 * noise_thresh
             likelihood = gp.likelihoods.MultitaskGaussianLikelihood(num_tasks=n_tasks, batch_shape=multilik_batch_shape,
+                                                                    has_global_noise=False,
                                                                     noise_constraint=gp.constraints.GreaterThan(noise_thresh))
-            likelihood.noise = noise_init
             likelihood.task_noises = torch.ones_like(likelihood.task_noises) * noise_init
 
         self.likelihood = likelihood
-        self.n_tasks, self.n_latents, self.n_batch = n_tasks, n_latents, n_batch
+        self.n_tasks = n_tasks
+        self.n_latents = n_latents
+        self.shape_batch = multilik_batch_shape
         self.n_points = n_points
         self.decomp = decomp
         self.outputscales = outputscales
 
         if init_lmc_coeffs :
             U, S, V = compute_truncated_svd(Y=train_y, n_latents=n_latents, axes_layout=axes_layout)
-            S = S / np.sqrt(n_points - 1)
-            lmc_coefficients = (U * S).mT
+            S = S / np.sqrt(n_points - 1) # seems to work better, but is it justified ?
+            lmc_coefficients = (U * S.unsqueeze(-2)).mT
             self.variational_strategy.lmc_coefficients = torch.nn.Parameter(lmc_coefficients)  #shape (n_batch x) n_latents x n_tasks
 
     def forward( self, x:Tensor )-> Tensor:

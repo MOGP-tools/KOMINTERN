@@ -63,7 +63,7 @@ class ExactGPModel(gp.models.ExactGP):
         elif len(train_y.shape) == 3:
             n_batch, n_tasks, n_points = train_y.shape
             batch_shape = torch.Size([n_batch, n_tasks])
-            multilik_batch_shape = torch.Size([n_tasks])
+            multilik_batch_shape = torch.Size([n_batch])
 
         batch_lik = batch_lik or batch_shape == (1,1)
         if likelihood is None:
@@ -73,8 +73,8 @@ class ExactGPModel(gp.models.ExactGP):
                 likelihood.noise = noise_init * torch.ones_like(likelihood.noise)
             else:
                 likelihood = gp.likelihoods.MultitaskGaussianLikelihood(num_tasks=n_tasks, batch_shape=multilik_batch_shape,
-                                                    noise_constraint=gp.constraints.GreaterThan(noise_thresh))
-                likelihood.noise = noise_init
+                                                                        has_global_noise=False,
+                                                                        noise_constraint=gp.constraints.GreaterThan(noise_thresh))
                 likelihood.task_noises = torch.ones_like(likelihood.task_noises) * noise_init
                 
         super(ExactGPModel, self).__init__(train_x, train_y, likelihood)
