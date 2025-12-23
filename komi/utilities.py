@@ -126,11 +126,24 @@ class SplineKernel(gp.kernels.Kernel):
             res = res.unsqueeze(batch_dim).expand(*self.batch_shape, *res.shape)
         return res
 
-class FixedRQKernel(RQKernel):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.raw_alpha.requires_grad = False
-        self.alpha = 8
+# class FixedRQKernel(RQKernel):
+#     def __init__(self, *args, **kwargs):
+#         super().__init__(*args, **kwargs)
+#         self.raw_alpha.requires_grad = False
+#         self.alpha = 8
+
+class FixedRQKernel(gp.kernels.Kernel):
+    has_lengthscale = True
+
+    def forward(self, x1, x2, **params):
+        x1_ = x1.div(self.lengthscale)
+        x2_ = x2.div(self.lengthscale)
+        diff = self.covar_dist(x1_, x2_, **params)
+        alpha = 8
+        res = (1 + 0.5 * diff / alpha)
+        for i in range(3):
+            res = res*res
+        return 1/res
 
 class PolynomialMean(gp.means.mean.Mean):
     def __init__( self, input_size, batch_shape=torch.Size(), bias=True, degree=3):
@@ -250,7 +263,7 @@ class LeaveOneOutPseudoLikelihood(gp.mlls.exact_marginal_log_likelihood.ExactMar
     
 ## Model definition and initialization
     
-def handle_covar_( kernel: Kernel, dim: int, decomp: Union[List[List[int]], None, dict]=None, n_funcs:int=1,
+def handle_covar_( kernel: Kernel, dim: int, decomp: Union[List[List[int]], None, dict]=None, batch_shape:torch.Size=torch.Size(),
                    prior_scales:Union[Tensor,None]=None, prior_width:Union[Tensor,None]=None, outputscales:bool=True,
                    disc_ranks:Tuple[int,...]=(), ker_kwargs:Union[dict, None]=None )-> Kernel:
 
@@ -261,7 +274,7 @@ def handle_covar_( kernel: Kernel, dim: int, decomp: Union[List[List[int]], None
         dim: dimension of the data (number of variables)
         decomp: instructions to create a composite kernel with subgroups of variables. Defaults to None
         | Ex : decomp = [[0,1],[1,2]] --> k(x0,x1,x2) = k1(x0,x1) + k2(x1,x2)
-        n_funcs: batch dimension (number of tasks or latent functions depending on the case), defaults to 1
+        batch_shape: batch dimensions (number of tasks or latent functions depending on the case, plus number of models to train in parallel)
         prior_scales: mean values of the prior for characteristic lengthscales. Defaults to None
         prior_width: deviation_to_mean ratio of the prior for characteristic lengthscales. Defaults to None
         outputscales: whether or not the full kernel has a learned scaling factor, i.e k(x) = a* k'(x). 
@@ -308,7 +321,7 @@ def handle_covar_( kernel: Kernel, dim: int, decomp: Union[List[List[int]], None
                                                               scale=prior_scales[i_ker]*prior_width[i_ker])
 
     kernels_args = [{'ard_num_dims': len(idx_list), 'active_dims': idx_list, 'lengthscale_prior': l_priors[i_ker],
-                         'batch_shape': torch.Size([n_funcs])} for i_ker, idx_list in enumerate(decomp)]
+                         'batch_shape': batch_shape} for i_ker, idx_list in enumerate(decomp)]
 
     kernels = []
     for i_ker, ker_args in enumerate(kernels_args):
@@ -316,18 +329,18 @@ def handle_covar_( kernel: Kernel, dim: int, decomp: Union[List[List[int]], None
         kernels.append(ker)
 
     if len(decomp) > 1 :
-        covar_module = gp.kernels.ScaleKernel(kernels[0], batch_shape=torch.Size([n_funcs]))
+        covar_module = gp.kernels.ScaleKernel(kernels[0], batch_shape=batch_shape)
         for ker in kernels[1:]:
-            covar_module += gp.kernels.ScaleKernel(ker, batch_shape=torch.Size([n_funcs]))
+            covar_module += gp.kernels.ScaleKernel(ker, batch_shape=batch_shape)
     else:
         if outputscales:
-            covar_module = gp.kernels.ScaleKernel(kernels[0], batch_shape=torch.Size([n_funcs]))
+            covar_module = gp.kernels.ScaleKernel(kernels[0], batch_shape=batch_shape)
         else:
             covar_module = kernels[0]
     
     for i_disc, el in enumerate(disc_vars):
         var_location, n_vals = el
-        covar_module *= gp.kernels.IndexKernel(num_tasks=n_vals, active_dims=var_location, rank=disc_ranks[i_disc], batch_shape=torch.Size([n_funcs]))
+        covar_module *= gp.kernels.IndexKernel(num_tasks=n_vals, active_dims=var_location, rank=disc_ranks[i_disc], batch_shape=batch_shape)
 
     if prior_scales is not None and kernels[0].has_lengthscale:
         try:
@@ -344,21 +357,64 @@ def handle_covar_( kernel: Kernel, dim: int, decomp: Union[List[List[int]], None
     return covar_module
 
 def init_lmc_coefficients( train_y: Tensor, n_latents: int, QR_form:bool=False):
-    n_data, __ = train_y.shape
-    if n_data >= n_latents:
-        U, S, Vt = randomized_svd(train_y.cpu().numpy().T, n_components=n_latents, random_state=0)
-        U, S = torch.as_tensor(U, device=train_y.device, dtype=train_y.dtype), torch.as_tensor(S, device=train_y.device, dtype=train_y.dtype)
-    else:
-        Q, R = np.linalg.qr(train_y.cpu().numpy().T, mode='complete')
-        S = 1e-3 * torch.ones(n_latents, device=train_y.device, dtype=train_y.dtype)
-        S[:n_data] = torch.as_tensor(np.diag(R).copy(), device=train_y.device, dtype=train_y.dtype)
-        U = torch.as_tensor(Q[:,:n_latents], device=train_y.device, dtype=train_y.dtype)
-    S = S / np.sqrt(n_data - 1)
+    # n_data, n_tasks, n_batch = train_y.shape
+    n_batch, n_data, n_tasks = train_y.shape
+    Us, Ss = [], []
+    dtype, device = train_y.dtype, train_y.device
+    train_y = train_y.cpu().numpy()
+    for i in range(n_batch):
+        if n_data >= n_latents:
+            U, S, Vt = randomized_svd(train_y[i, ...].T, n_components=n_latents, random_state=0)
+        else:
+            Q, R = np.linalg.qr(train_y[i, ...].T, mode='complete') # use np QR instead of torch's to have positive diagonal of R
+            S = 1e-3 * np.ones(n_latents)
+            S[:n_data] = np.diag(R).copy()
+            U = Q[:,:n_latents]
+        Us.append(U)
+        Ss.append(S[None, :])
+
+    S_tens = np.stack(Ss, axis=0)
+    U_tens = np.stack(Us, axis=0)
+    S_tens = S_tens / np.sqrt(n_data - 1)
+    U_tens = torch.as_tensor(U_tens, device=device, dtype=dtype)
+    S_tens = torch.as_tensor(S, device=device, dtype=dtype)
     if QR_form:
-        return U, S
+        return U_tens, S_tens
     else:
-        y_transformed = U * S
-    return y_transformed.T
+        y_transformed = U_tens * S_tens
+    return y_transformed.mT # shape (n_batch x) n_latents x n_tasks
+
+
+def compute_truncated_svd(Y: Tensor, n_latents: int, axes_layout:dict[str, int]):
+    """
+    Return shapes:
+    U: (n_batch x) n_tasks x n_lat
+    S: (n_batch x) n_lat
+    V: (n_batch x) n_points x n_lat
+    """
+    if len(axes_layout) != len(Y.shape):
+        raise ValueError("Provided axis layout ({0}) doesn't match the shape of the tensor to process: {1}".format(axes_layout, Y.shape))
+    axes_len = {axis_name : Y.shape[axis_index] for axis_name, axis_index in axes_layout.items()}
+    n_points = axes_len['n_points']
+    # Objective : get to (n_batch, n_tasks, n_points) or (n_tasks, n_points)
+    if 'n_batch' in axes_layout:
+        permut = tuple(axes_layout[axis_name] for axis_name in ('n_batch', 'n_tasks', 'n_points'))
+    else:
+        permut = tuple(axes_layout[axis_name] for axis_name in ('n_tasks', 'n_points'))
+
+    Y_reshaped = torch.permute(Y, permut)
+    if n_points >= n_latents:
+        U, S, V = torch.svd_lowrank(Y_reshaped, q=n_latents)
+    else:
+        # very specific case, V is meaningless then. Only for initialization, is not a real SVD
+        Q, R = torch.linalg.qr(Y_reshaped, mode='complete') # shapes (minus batch) : Q -> n_tasks x n_tasks, R -> n_tasks x n_points
+        S = 1e-3 * torch.ones(R.shape[:-1])
+        S[..., :n_points] = torch.diag(R)
+        U = Q[..., :n_latents]
+        V = torch.ones_like(R.mT)
+        V = V[..., :n_latents]
+    return U, S, V
+
 ##----------------------------------------------------------------------------------------------------------------------
 
 ## Parametrizations

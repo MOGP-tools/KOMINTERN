@@ -62,14 +62,13 @@ def load_model(model): #, X=None, Y=None):
 def train_model(model_init, X, Y, argus, optimizer=None, compute_loo=False, return_optim=False, met_dict={}, extra_context_managers={}, 
                 keys=None, concs=None, devs=None, verbose=True):
     # try:
-    if len(Y.shape) == 1:
-        n_points, n_tasks = Y.shape[0], 1
-    else:
-        n_points, n_tasks = Y.shape
+    total_n_tasks = np.prod(Y.shape[1:])
     model = load_model(model_init) #, X=X, Y=Y)
+
     if 'minibatch_size' in argus and argus['minibatch_size'] is not None:
         minibatch_size = argus['minibatch_size']
         train_dataset = torch.utils.data.TensorDataset(X, Y)
+        # TODO : adapt to the batch case
         train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=minibatch_size, shuffle=True, 
                                                     num_workers=0, pin_memory=argus['gpu'])
     else:
@@ -119,10 +118,11 @@ def train_model(model_init, X, Y, argus, optimizer=None, compute_loo=False, retu
             else:
                 output_train = model(X)
                 loss = -mll(output_train, Y)
+                loss = loss.sum()
                 
             new_loss += loss.item()
             if not isinstance(model, MultitaskGPModel):
-                new_loss /= n_tasks
+                new_loss /= total_n_tasks
             if verbose and argus['print_loss'] and i%argus['freq_print']==0:
                 print(new_loss)
             loss.backward()
@@ -203,10 +203,10 @@ def predict(model, X_test, gpu=False, extra_context_managers={}, compute_var=Tru
                 full_likelihood = model.full_likelihood(diag=True) if hasattr(model, 'full_likelihood') else model.likelihood
             free_mem = torch.cuda.mem_get_info()[0]
             num_bytes = X_test.element_size()
-            n_tasks = model.n_tasks
+            total_n_tasks = np.prod(model.batch_shape)
             n_points = len(model.train_inputs[0]) if hasattr(model, 'train_inputs') \
                 else len(model.variational_strategy.base_variational_strategy.inducing_points)
-            batch_size = int(free_mem / (16 * n_points * n_tasks * num_bytes)) # à optimiser proprement
+            batch_size = int(free_mem / (16 * n_points * total_n_tasks * num_bytes)) # à optimiser proprement
             preds, vars = [], [] 
             for i in range(0, len(X_test), batch_size):
                 x_batch = X_test[i:i+batch_size]
@@ -264,16 +264,17 @@ def eval_model(model, X_test, Y_test, argus, met_dict, extra_context_managers={}
     ## Computation of some noise terms
     if compute_var:
         with torch.no_grad():
-            global_noise = full_likelihood.noise.squeeze() if hasattr(full_likelihood, 'noise') else 0.
+            global_noise = full_likelihood.noise if hasattr(full_likelihood, 'noise') else 0.
             n_tasks = Y_test.shape[1]
             if hasattr(full_likelihood, 'task_noise_covar_factor'):
-                noise_mat_root = full_likelihood.task_noise_covar_factor.squeeze()
+                noise_mat_root = full_likelihood.task_noise_covar_factor
                 noise_mat = noise_mat_root.matmul(noise_mat_root.t()) + global_noise * torch.eye(n_tasks, device=noise_mat_root.device)
                 av_noise = torch.diag(noise_mat).mean()
             elif hasattr(full_likelihood, 'task_noises'):
-                av_noise = (full_likelihood.task_noises.squeeze() + global_noise).mean()
+                task_noises = full_likelihood.task_noises
+                av_noise = (task_noises + torch.broadcast_to(global_noise, task_noises.shape)).mean()
             else:
-                av_noise = global_noise
+                av_noise = global_noise.mean()
         av_noise = av_noise.cpu().numpy()
     else:
         av_noise = 0.

@@ -10,7 +10,7 @@ from gpytorch.kernels.kernel import Kernel
 from gpytorch.likelihoods.likelihood import Likelihood
 from scipy.stats import qmc
 
-from .utilities import init_lmc_coefficients, handle_covar_
+from .utilities import init_lmc_coefficients, handle_covar_, compute_truncated_svd
 
 class CustomLMCVariationalStrategy(gp.variational.LMCVariationalStrategy):
     """
@@ -36,7 +36,7 @@ class CustomLMCVariationalStrategy(gp.variational.LMCVariationalStrategy):
         """
         multitask_dist = super().__call__(x, task_indices=None, prior=False, **kwargs)
         tasks_means = self.output_mean_module(x)
-        return multitask_dist.__class__(multitask_dist.mean + tasks_means.T, multitask_dist.lazy_covariance_matrix)
+        return multitask_dist.__class__(multitask_dist.mean + tasks_means.mT, multitask_dist.lazy_covariance_matrix)
 
 
 class VariationalMultitaskGPModel(gp.models.ApproximateGP):
@@ -45,9 +45,8 @@ class VariationalMultitaskGPModel(gp.models.ApproximateGP):
     """
     def __init__( self,
                  train_x:Tensor,
+                 train_y:Tensor,
                  n_latents:int,
-                 n_tasks:Union[int,None]=None,
-                 train_y:Union[Tensor,None]=None,
                  train_ind_ratio:float=1.5,
                  likelihood:Union[Likelihood,None]=None, 
                  kernel_type:Kernel=gp.kernels.RBFKernel,
@@ -67,10 +66,9 @@ class VariationalMultitaskGPModel(gp.models.ApproximateGP):
         """
         Args:
             train_x: training input data
+            train_y: training data labels, used only for the SVD initialization of LMC coefficients (with this model, data labels are only used 
+            | during loss computation, not predictions)
             n_latents: number of latent processes
-            n_tasks: number of output tasks. It must provided when train_y is not None in order to dimension the model. Defaults to None.
-            train_y: training data labels, used only for the SVD initialization of LMC coefficients ; with this model, data labels are only used 
-            during loss computation, not predictions. It doesn't need to be provided if this initialization is not used. Defaults to None.
             train_ind_ratio: ratio between the number of training points and this of inducing points. Defaults to 1.5.
             likelihood: gpytorch likelihood function for the outputs. If none is provided, a default MultitaskGaussianLikelihood is used. Defaults to None.
             kernel_type: gpytorch kernel function for the latent processes. Defaults to gp.kernels.RBFKernel.
@@ -92,16 +90,21 @@ class VariationalMultitaskGPModel(gp.models.ApproximateGP):
 
         if ker_kwargs is None:
             ker_kwargs = {}
-        self.n_points, self.dim = train_x.shape
-        if n_tasks is None :
-            if train_y is not None :
-                n_tasks = train_y.shape[1]
-            else:
-                raise ValueError('Number of tasks must be specified if no training labels are provided.')
-        else:
-            if train_y is not None and train_y.shape[1]!=n_tasks:
-                n_tasks = train_y.shape[1]
-                warnings.warn('Number of tasks in the training labels does not match the specified number of tasks. Defaulting to the number of tasks in the training labels.')
+
+        _, dim = train_x.shape
+        if len(train_y.shape) == 2:
+            n_points, n_tasks = train_y.shape
+            axes_layout = {'n_points':0, 'n_tasks':1}
+            n_batch = 0
+            latent_batch_shape = torch.Size([n_latents])
+            output_batch_shape = torch.Size([n_tasks])
+            multilik_batch_shape = torch.Size()
+        elif len(train_y.shape) == 3:
+            n_batch, n_points, n_tasks = train_y.shape
+            axes_layout = {'n_batch':0, 'n_points':1, 'n_tasks':2}
+            latent_batch_shape = torch.Size([n_batch, n_latents])
+            output_batch_shape = torch.Size([n_batch, n_tasks])
+            multilik_batch_shape = torch.Size([n_tasks])
 
         if float(train_ind_ratio) == 1.:
             warnings.warn('Caution : inducing points not learned !')
@@ -111,14 +114,14 @@ class VariationalMultitaskGPModel(gp.models.ApproximateGP):
             distrib = gp.variational.CholeskyVariationalDistribution  #better compatibility in this case
         else:
             learn_inducing_locations = True
-            n_ind_points = int(np.floor(self.n_points / train_ind_ratio))
-            sampler = qmc.LatinHypercube(d=self.dim, seed=seed)
+            n_ind_points = int(np.floor(n_points / train_ind_ratio))
+            sampler = qmc.LatinHypercube(d=dim, seed=seed)
             inducing_points = torch.as_tensor(2 * sampler.random(n=n_ind_points) - 1, dtype=train_x.dtype)
             #same inducing points for all latents here
 
-        variational_distribution = distrib(inducing_points.size(-2), batch_shape=torch.Size([n_latents]))
+        variational_distribution = distrib(inducing_points.size(-2), batch_shape=latent_batch_shape)
         strategy = var_strat(self, inducing_points, variational_distribution, learn_inducing_locations=learn_inducing_locations)
-        output_mean_module = mean_type(input_size=self.dim, batch_shape=torch.Size([n_tasks]))
+        output_mean_module = mean_type(input_size=dim, batch_shape=output_batch_shape)
 
         variational_strategy = CustomLMCVariationalStrategy(
             output_mean_module,
@@ -130,30 +133,28 @@ class VariationalMultitaskGPModel(gp.models.ApproximateGP):
 
         super().__init__(variational_strategy)
 
-        self.covar_module = handle_covar_(kernel_type, dim=self.dim, decomp=decomp, disc_ranks=disc_ranks, prior_scales=prior_scales,
-                                            prior_width=prior_width, n_funcs=n_latents, ker_kwargs=ker_kwargs, outputscales=outputscales)
-        self.mean_module = gp.means.ZeroMean(batch_shape=torch.Size([n_latents])) #in gp, latent processes can have non-zero means, which we wish to avoid
+        self.covar_module = handle_covar_(kernel_type, dim=dim, decomp=decomp, disc_ranks=disc_ranks, prior_scales=prior_scales,
+                            prior_width=prior_width, batch_shape=latent_batch_shape, ker_kwargs=ker_kwargs, outputscales=outputscales)
+        self.mean_module = gp.means.ZeroMean(batch_shape=latent_batch_shape) #in gp, latent processes can have non-zero means, which we wish to avoid
 
         if likelihood is None:
             noise_init = 10 * noise_thresh
-            likelihood = gp.likelihoods.MultitaskGaussianLikelihood(num_tasks=n_tasks,
+            likelihood = gp.likelihoods.MultitaskGaussianLikelihood(num_tasks=n_tasks, batch_shape=multilik_batch_shape,
                                                                     noise_constraint=gp.constraints.GreaterThan(noise_thresh))
             likelihood.noise = noise_init
-            likelihood.task_noises = torch.ones(n_tasks, device=train_y.device) * noise_init
+            likelihood.task_noises = torch.ones_like(likelihood.task_noises) * noise_init
 
         self.likelihood = likelihood
-        self.n_tasks, self.n_latents, self.decomp = n_tasks, n_latents, decomp
+        self.n_tasks, self.n_latents, self.n_batch = n_tasks, n_latents, n_batch
+        self.n_points = n_points
+        self.decomp = decomp
         self.outputscales = outputscales
 
         if init_lmc_coeffs :
-            if train_y is None :
-                warnings.warn('No training labels provided. LMC coefficients will be initialized randomly.')
-                # no need to register the parameter here, as it is already done in the variational strategy
-            else :
-                lmc_coefficients = init_lmc_coefficients(train_y, n_latents=n_latents)
-                if train_y.device.type=='cuda':
-                    lmc_coefficients = lmc_coefficients.cuda()
-                self.variational_strategy.register_parameter("lmc_coefficients", torch.nn.Parameter(lmc_coefficients))  #shape n_latents x n_tasks
+            U, S, V = compute_truncated_svd(Y=train_y, n_latents=n_latents, axes_layout=axes_layout)
+            S = S / np.sqrt(n_points - 1)
+            lmc_coefficients = (U * S).mT
+            self.variational_strategy.lmc_coefficients = torch.nn.Parameter(lmc_coefficients)  #shape (n_batch x) n_latents x n_tasks
 
     def forward( self, x:Tensor )-> Tensor:
         """

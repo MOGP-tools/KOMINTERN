@@ -10,7 +10,7 @@ from linear_operator.operators.dense_linear_operator import to_linear_operator
 from sklearn.decomposition import TruncatedSVD
 
 from .base_gp import ExactGPModel
-from .utilities import SplineKernel
+from .utilities import SplineKernel, compute_truncated_svd
 
 class LazyLMCModel(ExactGPModel):
     """
@@ -37,27 +37,38 @@ class LazyLMCModel(ExactGPModel):
             and can be inputed to the compute_loo() method in any case. Default is False.
             jitter_val: jitter value added to the predictive covariance matrix of the model. Default is 1e-8.
         """
-        n_points, n_tasks = train_y.shape
-        proj_likelihood = gp.likelihoods.GaussianLikelihood(batch_shape=torch.Size([n_latents]),
-                                        noise_constraint=gp.constraints.GreaterThan(0.5 * noise_val))
+        if len(train_y.shape) == 2:
+            n_tasks, n_points = train_y.shape
+            axes_layout = {'n_points':0, 'n_tasks':1}
+            n_batch = 0
+            latent_batch_shape = torch.Size([n_latents])
+        elif len(train_y.shape) == 3:
+            n_batch, n_tasks, n_points = train_y.shape
+            axes_layout = {'n_batch':0, 'n_points':1, 'n_tasks':2}
+            latent_batch_shape = torch.Size([n_batch, n_latents])
+
+        proj_likelihood = gp.likelihoods.GaussianLikelihood(batch_shape=latent_batch_shape,
+                                noise_constraint=gp.constraints.GreaterThan(0.5 * noise_val))
         proj_likelihood.noise = noise_val
         
-        SVD = TruncatedSVD(n_components=n_latents)
-        y_transformed = SVD.fit_transform(train_y.cpu().T) #shape : n_tasks * n_latents
-        proj_y = torch.as_tensor(SVD.components_.T) #shape : n_points * n_latents
-        super().__init__(train_x=train_x, train_y=proj_y.T, likelihood=proj_likelihood, n_tasks=n_latents, kernel_type=SplineKernel,
-                         mean_type=gp.means.ZeroMean, outputscales=False, n_inducing_points=None, **kwargs) # !! proj_likelihood will only be named likelihood in the model
+        U, S, V = compute_truncated_svd(Y=train_y, n_latents=n_latents, axes_layout=axes_layout)
+        lmc_coeffs = (U * S).mT
+        proj_y = V
 
-        self.register_buffer('lmc_coeffs', torch.as_tensor(y_transformed.T, device=train_y.device))
+        super().__init__(train_x=train_x, train_y=proj_y, likelihood=proj_likelihood, n_tasks=n_latents, kernel_type=SplineKernel,
+                         mean_type=gp.means.ZeroMean, outputscales=False, n_inducing_points=None, batch_lik=True, **kwargs)
+        # !! proj_likelihood will only be named likelihood in the model
+
+        self.register_buffer('lmc_coeffs', lmc_coeffs)
         if store_full_y:
             self.register_buffer('train_y', train_y)
         self.full_lik = gp.likelihoods.MultitaskGaussianLikelihood(num_tasks=n_tasks,
                                                     noise_constraint=gp.constraints.GreaterThan(noise_val))
         self.full_lik.noise = noise_val
         self.full_lik.task_noises = noise_val
-        n_data, n_tasks = train_y.shape
         self.n_tasks = n_tasks
         self.n_latents = n_latents
+        self.axes_layout = axes_layout
         self.noise_val = noise_val
         self.latent_dim = -1
         if jitter_val is None:
@@ -77,7 +88,7 @@ class LazyLMCModel(ExactGPModel):
         """
         Returns the matrix T of shape n_tasks x n_latents, such that YT is the "projected data" seen by latent processes 
         """
-        return self.lmc_coeffs.T
+        return self.lmc_coeffs.mT
 
     def project_data( self, data) -> Tensor:
         """
@@ -91,7 +102,7 @@ class LazyLMCModel(ExactGPModel):
         if hasattr(self, 'train_y') and data is self.train_y:
             return self.train_targets
         else:
-            return (data @ self.projection_matrix()).T # shape n_latents x n_points ; opposite convention to most other quantities !!
+            return (data @ self.projection_matrix()).mT # shape n_latents x n_points ; opposite convention to most other quantities !!
 
     def full_likelihood( self, **kwargs ) -> Likelihood :
         """
@@ -142,6 +153,7 @@ class LazyLMCModel(ExactGPModel):
         Returns:
             A tuple containing the LOO variances and error gaps for each task (each of size n_points x n_tasks, or n_points x n_latents if latent=True).
         """
+        # TODO : adapt to the batch case
         if not latent:
             if hasattr(self, 'train_y'):
                 train_y = self.train_y
@@ -158,11 +170,11 @@ class LazyLMCModel(ExactGPModel):
             L = K.cholesky(upper=False)
             loo_var = 1.0 / L._cholesky_solve(identity[None,:], upper=False).diagonal(dim1=-1, dim2=-2)
             loo_delta = L._cholesky_solve(y_proj.unsqueeze(-1), upper=False).squeeze(-1) * loo_var
-            loo_var, loo_delta = loo_var.T, loo_delta.T
+            loo_var, loo_delta = loo_var.mT, loo_delta.mT
             if not latent:
                 lmc_coeffs = self.lmc_coefficients()
                 e_loo_raw = (loo_delta @ lmc_coeffs)
-                diff = (train_y - y_proj.T @ lmc_coeffs)
+                diff = (train_y - y_proj.mT @ lmc_coeffs)
                 loo_delta = e_loo_raw + diff
                 loo_var = loo_var @ lmc_coeffs**2
         return loo_var, loo_delta
@@ -173,12 +185,11 @@ class LazyLMCModel(ExactGPModel):
         Replaces the current training data of the model. Overrides the parent method to store the training labels in the model and the new LMC coefficients
         deduced from them.
         """
-        SVD = TruncatedSVD(n_components=self.n_latents)
-        y_transformed = SVD.fit_transform(targets.cpu().T) #shape : n_tasks * n_latents
-        proj_y = torch.as_tensor(SVD.components_.T, device=self.train_targets.device, dtype=self.train_targets.dtype) #shape : n_points * n_latents
-        super().set_train_data(inputs=inputs, targets=proj_y.T, strict=strict)
-        new_lmc_coeffs = torch.as_tensor(y_transformed.T, device=self.lmc_coeffs.device, dtype=self.lmc_coeffs.dtype)
-        self.lmc_coeffs = new_lmc_coeffs
+        U, S, V = compute_truncated_svd(Y=self.train_y, n_latents=self.n_latents, axes_layout=self.axes_layout)
+        lmc_coeffs = (U * S).mT
+        proj_y = V
+        super().set_train_data(inputs=inputs, targets=proj_y.mT, strict=strict)
+        self.lmc_coeffs = lmc_coeffs
         if hasattr(self, 'train_y'):
             self.train_y = targets
 

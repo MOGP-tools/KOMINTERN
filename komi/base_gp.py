@@ -21,7 +21,6 @@ class ExactGPModel(gp.models.ExactGP):
                   train_x:Tensor,
                   train_y:Tensor,
                   likelihood:Union[Likelihood,None]=None,
-                  n_tasks: int = 1,
                   kernel_type:Kernel=gp.kernels.RBFKernel,
                   mean_type:Mean=gp.means.ConstantMean,
                   decomp:Union[List[List[int]], None]=None,
@@ -40,7 +39,6 @@ class ExactGPModel(gp.models.ExactGP):
             train_x: training input data
             train_y: training data labels
             likelihood: likelihood function for the model. If None, a Gaussian likelihood is used. Defaults to None.
-            n_tasks: number of output tasks. Defaults to 1.
             kernel_type: . gp kernel function for latent processes. Defaults to gp.kernels.RBFKernel.
             mean_type: gp mean function for the outputs. Defaults to gp.means.ConstantMean.
             decomp: instructions to create a composite kernel with subgroups of variables. Ex : decomp = [[0,1],[1,2]] --> k(x0,x1,x2) = k1(x0,x1) + k2(x1,x2). Defaults to None.
@@ -55,20 +53,29 @@ class ExactGPModel(gp.models.ExactGP):
             ker_kwargs: Additional arguments to pass to the gp kernel function. Defaults to None.
             jitter_val: jitter value for the Cholesky decomposition of the kernel matrix in specific leave-one-out computations. Defaults to 1e-6.
         """
+        if len(train_y.shape) == 1:
+            train_y = train_y.view(1,-1) # add a task axis
+        if len(train_y.shape) == 2:
+            n_tasks, n_points = train_y.shape
+            n_batch = 0
+            batch_shape = torch.Size([n_tasks])
+            multilik_batch_shape = torch.Size()
+        elif len(train_y.shape) == 3:
+            n_batch, n_tasks, n_points = train_y.shape
+            batch_shape = torch.Size([n_batch, n_tasks])
+            multilik_batch_shape = torch.Size([n_tasks])
+
+        batch_lik = batch_lik or batch_shape == (1,1)
         if likelihood is None:
             noise_init = 10 * noise_thresh
-            if n_tasks == 1:
-                likelihood = gp.likelihoods.GaussianLikelihood(noise_constraint=gp.constraints.GreaterThan(noise_thresh))
-                likelihood.noise = noise_init
-            elif batch_lik :
-                likelihood = gp.likelihoods.GaussianLikelihood(batch_shape=torch.Size([n_tasks]),
-                                                    noise_constraint=gp.constraints.GreaterThan(noise_thresh))
+            if batch_lik :
+                likelihood = gp.likelihoods.GaussianLikelihood(batch_shape=batch_shape, noise_constraint=gp.constraints.GreaterThan(noise_thresh))
                 likelihood.noise = noise_init * torch.ones_like(likelihood.noise)
             else:
-                likelihood = gp.likelihoods.MultitaskGaussianLikelihood(num_tasks=n_tasks,
+                likelihood = gp.likelihoods.MultitaskGaussianLikelihood(num_tasks=n_tasks, batch_shape=multilik_batch_shape,
                                                     noise_constraint=gp.constraints.GreaterThan(noise_thresh))
                 likelihood.noise = noise_init
-                likelihood.task_noises = torch.ones(n_tasks, device=train_y.device) * noise_init
+                likelihood.task_noises = torch.ones_like(likelihood.task_noises) * noise_init
                 
         super(ExactGPModel, self).__init__(train_x, train_y, likelihood)
 
@@ -76,11 +83,12 @@ class ExactGPModel(gp.models.ExactGP):
             ker_kwargs = {}
         self.dim = train_x.shape[1]
         self.n_tasks = n_tasks
-        self.batch_lik = isinstance(likelihood, gp.likelihoods.GaussianLikelihood)
-        self.mean_module = mean_type(input_size=self.dim, batch_shape=torch.Size([n_tasks]))
+        self.batch_shape = batch_shape
+        self.batch_lik = batch_lik
+        self.mean_module = mean_type(input_size=self.dim, batch_shape=batch_shape)
         self.covar_module = handle_covar_(kernel_type, dim=self.dim, decomp=decomp, disc_ranks=disc_ranks,
                                           prior_scales=prior_scales, prior_width=prior_width, outputscales=outputscales,
-                                          n_funcs=n_tasks, ker_kwargs=ker_kwargs)
+                                          batch_shape=batch_shape, ker_kwargs=ker_kwargs)
         if n_inducing_points is not None:
             self.covar_module = gp.kernels.InducingPointKernel(self.covar_module, torch.randn(n_inducing_points, self.dim), likelihood)
         
@@ -102,11 +110,10 @@ class ExactGPModel(gp.models.ExactGP):
         """
         mean_x = self.mean_module(x)
         covar_x = self.covar_module(x)
-        if not self.batch_lik and self.n_tasks > 1 : # for the batch case, but not the projected model inheritance
-            return gp.distributions.MultitaskMultivariateNormal.from_batch_mvn(
-                gp.distributions.MultivariateNormal(mean_x, covar_x))
-        else:
+        if self.batch_lik:
             return gp.distributions.MultivariateNormal(mean_x, covar_x)
+        else:
+            return gp.distributions.MultitaskMultivariateNormal.from_batch_mvn(gp.distributions.MultivariateNormal(mean_x, covar_x))
 
 
     def lscales( self, unpacked:bool=True )-> Union[List[Tensor], Tensor]:  # returned format : n_kernels x n_dims
@@ -142,6 +149,7 @@ class ExactGPModel(gp.models.ExactGP):
         Returns:
             A tensor representing the learned outputscales of each subkernel and each task (shape n_tasks x n_kernels)
         """
+        # TODO : adapt to the batch case
         n_kernels = len(self.covar_module.kernels) if hasattr(self.covar_module, 'kernels') else 1
         n_funcs = self.n_latents if hasattr(self, 'n_latents') else self.n_tasks  ## to distinguish between the projected and batch-exact cases
         res = torch.zeros((n_funcs, n_kernels))
@@ -175,6 +183,7 @@ class ExactGPModel(gp.models.ExactGP):
         Returns:
             A tuple containing the LOO variances and error gaps for each task (each of size n_points x n_tasks)
         """
+        # TODO : adapt to the batch case
         train_x, train_y = self.train_inputs[0], self.train_targets
         likelihood = self.likelihood
         eps = self.jitter_val

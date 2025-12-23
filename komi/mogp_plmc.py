@@ -20,36 +20,47 @@ class LMCMixingMatrix(torch.nn.Module):
     Class for the parametrized mixing matrix of projected models. Making it a separate class allows to call 
     torch.nn.utils.parametrizations.orthogonal onto it during instanciation of a ProjectedGPModel
     """
-    def __init__( self, Q_plus:Tensor, R:Tensor, bulk:bool=True, diagonal_R=False):
+    def __init__( self, Q_plus:Tensor, R:Tensor, bulk:bool=True, diagonal_R:bool=False, batch_dim:int=1):
         """
 
         Args:
             Q_plus: (augmented) orthonormal part of the mixing matrix, of shape n_tasks x n_latents or n_tasks x n_tasks
             R: upper triangular part of the mixing matrix, of shape n_latents x n_latents
             bulk: whether to parametrize the mixing matrix as a unique n_tasks x n_latents (or n_tasks x n_tasks) matrix with no
-            specific property, or as a product of its Q and R factors. The first option is only possible if no constraint is put on these factors.
-            It is generally faster and more stable, but can be less so in the "augmented" case (general PLMC) where a n_tasks x n_tasks matrix must be parametrized.
-            Defaults to True.
+            | specific property, or as a product of its Q and R factors. The first option is only possible if no constraint is put on these factors.
+            | It is generally faster and more stable, but can be less so in the "augmented" case (general PLMC) where a n_tasks x n_tasks matrix must be parametrized.
+            | Defaults to True.
+            batch_dim: if >1, this object will represent a batch of mixing matrices
         """
         super().__init__()
-        if Q_plus.shape[1]==Q_plus.shape[0]:
+        if len(Q_plus.shape) != len(R.shape):
+            raise ValueError("Q_plus and R have different number of axes: {0} and {1}".format(Q_plus.shape, R.shape))
+        elif len(Q_plus.shape) == 3:
+            if Q_plus.shape[0] != R.shape[0]:
+                raise ValueError("Q_plus and R have different batch sizes: {0} and {1}".format(Q_plus.shape[0], R.shape[0]))
+        elif len(Q_plus.shape) == 2:
+            Q_plus = Q_plus.unsqueeze(0) # add a batch dimension
+            R = R.unsqueeze(0)
+
+        if Q_plus.shape[2]==Q_plus.shape[1]:
             ## If the inputed Q matrix is of shape n_tasks x n_tasks, we assume that it is the augmented Q_plus matrix
             self.mode = 'Q_plus'
-        elif Q_plus.shape[1]==R.shape[0]:
+        elif Q_plus.shape[2]==R.shape[1]:
             ## If the inputed Q matrix is of shape n_tasks x n_latents, we assume that it is the regular Q matrix (Q factor of the QR decomposition of the mixing matrix)
             self.mode = 'Q'
         else:
-            raise ValueError('Wrong dimensions for Q_plus : should be n_tasks x n_tasks or n_tasks x n_latents')
+            raise ValueError('Wrong dimensions for Q_plus : should be (n_batch x) n_tasks x n_tasks or (n_batch x) n_tasks x n_latents')
         
-        self.n_latents = R.shape[0]
-        self.n_tasks = Q_plus.shape[0]
-        self._size = torch.Size([self.n_latents, self.n_tasks])
+        self.n_batch = R.shape[0]
+        self.n_latents = R.shape[1]
+        self.n_tasks = Q_plus.shape[1]
+        self._size = torch.Size([self.n_batch, self.n_latents, self.n_tasks])
         self.bulk = bulk
         self.diagonal_R = diagonal_R
         if bulk:
             if self.mode=='Q_plus':
-                R_padded = torch.eye(self.n_tasks)
-                R_padded[:self.n_latents, :self.n_latents] = R
+                R_padded = torch.broadcast_to(torch.eye(self.n_tasks), (self.n_batch, 1, 1))
+                R_padded[:, :self.n_latents, :self.n_latents] = R
                 H = Q_plus @ R_padded
             else:
                 H = Q_plus @ R
@@ -65,7 +76,7 @@ class LMCMixingMatrix(torch.nn.Module):
             Q factor of the mixing matrix, of shape n_tasks x n_latents.
         """
         if self.mode=='Q_plus':
-            return self.Q_plus[:, :self.n_latents]
+            return self.Q_plus[:, :, :self.n_latents]
         else:
             return self.Q_plus
 
@@ -75,7 +86,7 @@ class LMCMixingMatrix(torch.nn.Module):
         Returns:
             Orthonormal complement of Q, of shape n_tasks x (n_tasks - n_latents).
         """
-        return self.Q_plus[:, self.n_latents:]
+        return self.Q_plus[:, :, self.n_latents:]
 
     def QR(self) -> Tuple[Tensor, Tensor, Union[Tensor,None]]:
         """
@@ -88,9 +99,9 @@ class LMCMixingMatrix(torch.nn.Module):
         if self.bulk:
             Q_plus, R_padded = torch.linalg.qr(self.H)
             if self.mode=='Q_plus':
-                Q = Q_plus[:, :self.n_latents]
-                Q_orth = Q_plus[:, self.n_latents:]
-                R = R_padded[:self.n_latents, :self.n_latents]
+                Q = Q_plus[:, :, :self.n_latents]
+                Q_orth = Q_plus[:, :, self.n_latents:]
+                R = R_padded[:, :self.n_latents, :self.n_latents]
             else:
                 Q, Q_orth, R = Q_plus, None, R_padded
         else:
@@ -101,20 +112,20 @@ class LMCMixingMatrix(torch.nn.Module):
 
     def forward( self ) -> Tensor:
         """
-        Outputs the full mixing matrix H, in transposed form in order to match the standard storage format of data labels.
+        Outputs the full (batch) mixing matrix H, in transposed form in order to match the standard storage format of data labels.
         Returns:
-            Transposed mixing matrix H, of shape n_tasks x n_latents.
+            Transposed mixing matrix H, of shape (n_batch x) n_tasks x n_latents.
         """
         if self.bulk:
             if self.diagonal_R:
                 Q, R, Q_orth = self.QR()
-                return (Q @ torch.diag_embed(torch.diag(R))).T
+                return (Q @ torch.diag_embed(torch.diag(R))).mT
             if self.mode == 'Q':
-                return self.H.T
+                return self.H.mT
             else:
-                return self.H[:,:self.n_latents].T
+                return self.H[:,:self.n_latents].mT
         else:
-            return (self.Q() @ self.R).T #format : n_latents x n_tasks
+            return (self.Q() @ self.R).mT #format : n_latents x n_tasks
 
     def size( self, int=None ) -> Union[int, torch.Size]:
         if int:
@@ -172,31 +183,36 @@ class ProjectedGPModel(ExactGPModel):
             jitter_val: jitter value for the Cholesky decomposition of the full noise covariance matrix, and for addition to the predictive covariance matrix.
             If None, it is set to the default gpytorch Cholesky jitter setting. Defaults to None.
         """
+        if len(train_y.shape) == 1:
+            train_y = train_y.view(-1, 1, 1) # add a task axis and a batch axis
+        if len(train_y.shape) == 2:
+            train_y = train_y.view(-1, -1, 1) # add a batch axis
+        n_points, n_tasks, n_batch = train_y.shape
+
         noise_init = 10 * noise_thresh
-        if proj_likelihood is None or proj_likelihood.noise.shape[0] != n_latents:
-            proj_likelihood = gp.likelihoods.GaussianLikelihood(batch_shape=torch.Size([n_latents]),
+        if proj_likelihood.noise.shape[-1] != n_latents:
+            warnings.warn("In projected GP model the dimension of the likelihood is the number of latent processes. "
+                  "Provided likelihood was the wrong shape or None, so it was replaced by a fresh one")
+        if proj_likelihood is None or proj_likelihood.noise.shape[-1] != n_latents:
+            proj_likelihood = gp.likelihoods.GaussianLikelihood(batch_shape=torch.Size((n_batch, n_latents)),
                                                     noise_constraint=gp.constraints.GreaterThan(noise_thresh))
             proj_likelihood.noise = noise_init * torch.ones_like(proj_likelihood.noise)
             
-        if proj_likelihood.noise.shape[0] != n_latents:
-            warnings.warn("In projected GP model the dimension of the likelihood is the number of latent processes. "
-                  "Provided likelihood was the wrong shape or None, so it was replaced by a fresh one")
-
 
         super().__init__(train_x, torch.zeros_like(train_y), proj_likelihood, n_tasks=n_latents, 
-                         mean_type=gp.means.ZeroMean, outputscales=outputscales, **kwargs) # !! proj_likelihood will only be named likelihood in the model
+                         mean_type=gp.means.ZeroMean, outputscales=outputscales, batch_lik=True, **kwargs)
+        # !! proj_likelihood will only be named likelihood in the model
         self.register_buffer('train_y', train_y)
 
         if mean_type is not gp.means.ZeroMean:
             raise ValueError('Projected GP model does not support non-zero output-wise means for now !')
 
-        n_data, n_tasks = train_y.shape
         if init_lmc_coeffs:
             if scalar_B and BDN:
                 Q_plus, R = init_lmc_coefficients(train_y, n_latents=n_latents, QR_form=True) # Q_plus has shape n_tasks x n_latents, R_padded has shape n_latents x n_latents        
             else:
                 Q_plus, R_padded = init_lmc_coefficients(train_y, n_latents=n_tasks, QR_form=True) # Q_plus has shape n_tasks x n_tasks, R_padded has shape n_tasks x n_latents
-                R = R_padded[:n_latents]
+                R = R_padded[:, :n_latents, :]
 
         R = torch.diag_embed(R)
         lmc_coefficients = LMCMixingMatrix(Q_plus, R, bulk=bulk, diagonal_R=diagonal_R)
@@ -209,25 +225,28 @@ class ProjectedGPModel(ExactGPModel):
                 torch.nn.utils.parametrize.register_parametrization(lmc_coefficients, "R", UpperTriangularParam())
         self.lmc_coefficients = lmc_coefficients
 
+        discarded_noise_tens = torch.ones((n_batch, n_tasks - n_latents))
         if scalar_B:
             diagonal_B = True
-            self.register_parameter("log_B_tilde", torch.nn.Parameter(np.log(noise_init) * torch.ones(n_tasks - n_latents)))
+            self.register_parameter("log_B_tilde", torch.nn.Parameter(np.log(noise_init) * discarded_noise_tens))
             torch.nn.utils.parametrize.register_parametrization(self, "log_B_tilde", ScalarParam(bounds=(np.log(noise_thresh), -np.log(noise_thresh))))
             if BDN:
                 self.register_buffer('Y_squared_norm', (train_y**2).sum()) # case of the PLMC_fast (term for MLL computation)
         elif diagonal_B:
-            self.register_parameter("log_B_tilde", torch.nn.Parameter(np.log(noise_init)*torch.ones(n_tasks - n_latents)))
+            self.register_parameter("log_B_tilde", torch.nn.Parameter(np.log(noise_init)*discarded_noise_tens))
             self.register_constraint("log_B_tilde", gp.constraints.GreaterThan(np.log(noise_thresh)))
         else:
-            self.register_parameter("B_tilde_inv_chol", torch.nn.Parameter(torch.diag_embed(np.log(1/noise_init)*torch.ones(n_tasks - n_latents))))
-            torch.nn.utils.parametrize.register_parametrization(self, "B_tilde_inv_chol", LowerTriangularParam(bounds=(np.log(noise_thresh), -np.log(noise_thresh))))
+            self.register_parameter("B_tilde_inv_chol", torch.nn.Parameter(torch.diag_embed(np.log(1/noise_init) * discarded_noise_tens)))
+            torch.nn.utils.parametrize.register_parametrization(self, "B_tilde_inv_chol",
+                                                                LowerTriangularParam(bounds=(np.log(noise_thresh), -np.log(noise_thresh))))
         self.diagonal_B, self.scalar_B = diagonal_B, scalar_B
 
         if not BDN:
-            self.register_parameter("M", torch.nn.Parameter(torch.zeros((n_latents, n_tasks - n_latents))))
+            self.register_parameter("M", torch.nn.Parameter(torch.zeros((n_batch, n_latents, n_tasks - n_latents))))
 
         self.n_tasks = n_tasks
         self.n_latents = n_latents
+        self.n_batch = n_batch
         self.latent_dim = -1
         self.outputscales = outputscales
         if jitter_val is None:
@@ -240,7 +259,7 @@ class ProjectedGPModel(ExactGPModel):
         """
         Returns a vector containing the modeled noises of latent processes. Its diagonal embedding is the matrix Sigma_P from the article.
         Returns:
-            Modeled noise vector of size n_latents. 
+            Modeled noise vector of size (n_batch x) n_latents. 
         """
         return self.likelihood.noise.squeeze(-1)
     
@@ -249,12 +268,12 @@ class ProjectedGPModel(ExactGPModel):
         """
         Returns matrix T from the reference article, such that YT is the "projected data" seen by latent processes
         Returns:
-            Projection matrix T, of shape n_tasks x n_latents. 
+            Projection matrix T, of shape (n_batch x) n_tasks x n_latents. 
         """
         Q, R, Q_orth = self.lmc_coefficients.QR()
-        H_pinv = torch.linalg.solve_triangular(R.T, Q, upper=False, left=False)  # shape n_tasks x n_latents
+        H_pinv = torch.linalg.solve_triangular(R.mT, Q, upper=False, left=False)  # shape (n_batch x) n_tasks x n_latents
         if hasattr(self, "M"):
-            return H_pinv + Q_orth @ self.M.T * self.projected_noise()[None,:]
+            return H_pinv + Q_orth @ self.M.mT * self.projected_noise()
         else:
             return H_pinv
 
@@ -262,17 +281,18 @@ class ProjectedGPModel(ExactGPModel):
         """
         Projects some data labels onto the latent space.
         Args:
-            data: data tensor of shape n_points x n_tasks
+            data: data tensor of shape (n_batch x) n_points x n_tasks
         Returns:
-            Projected data tensor of shape n_latents x n_points. This shape convention corresponds to the batch treatment in gpytorch, not to the usual convention.
+            Projected data tensor of shape (n_batch x) n_latents x n_points.
+            This shape convention corresponds to the batch treatment in gpytorch, not to the usual convention.
         """
         Q, R, Q_orth = self.lmc_coefficients.QR()
-        unscaled_proj = Q.T @ data.T
+        unscaled_proj = Q.mT @ data.mT
         Hpinv_times_Y = torch.linalg.solve_triangular(R, unscaled_proj, upper=True)  
         if hasattr(self, "M"):
-            return Hpinv_times_Y + self.projected_noise()[:,None] * self.M @ Q_orth.T @ data.T
+            return Hpinv_times_Y + self.projected_noise() * self.M @ Q_orth.mT @ data.mT
         else:
-            return Hpinv_times_Y # shape n_latents x n_points ; opposite convention to most other quantities !!
+            return Hpinv_times_Y # (n_batch x) shape n_latents x n_points ; opposite convention to most other quantities !!
 
     def full_likelihood( self, diag=False ) -> gp.likelihoods.MultitaskGaussianLikelihood:
         """
@@ -283,46 +303,51 @@ class ProjectedGPModel(ExactGPModel):
         Q, R, Q_orth = self.lmc_coefficients.QR()
         QR = Q @ R
         sigma_p = self.projected_noise()
-        if hasattr(self, "M"):
-            if self.diagonal_B:
-                B_tilde_root = torch.diag_embed(torch.exp(self.log_B_tilde / 2))
+        if self.scalar_B:
+            if self.n_latents < self.n_tasks:
+                B_tilde = torch.exp(self.log_B_tilde[0])
+                if diag:
+                    B_term = B_tilde * (1 - (Q**2).sum(dim=-1))
+                else:
+                    identities = torch.broadcast_to(torch.eye(self.n_tasks, device=self.log_B_tilde.device), (self.n_batch, 1, 1))
+                    B_term = B_tilde * (identities - Q @ Q.mT)
+                if hasattr(self, "M"):
+                    B_tilde = B_tilde * torch.broadcast_to(torch.eye(self.n_tasks - self.n_latents, device=self.log_B_tilde.device), (self.n_batch, 1, 1))
             else:
-                B_tilde_root = torch.linalg.solve_triangular(self.B_tilde_inv_chol, 
-                                            torch.eye(self.n_tasks - self.n_latents, device=self.B_tilde_inv_chol.device), upper=False).T
-            B_tilde = B_tilde_root @ B_tilde_root.T
-            B_term = Q_orth @ B_tilde @ Q_orth.T
-            M_term = - QR @ (sigma_p[:,None] * self.M) @ B_tilde @ Q_orth.T
-            Mt_term = M_term.T
-            D_term_rotated = torch.diag_embed(sigma_p) + sigma_p[:,None] * self.M @ B_tilde @ self.M.T * sigma_p[None,:]
-            D_term = QR @ D_term_rotated @ QR.T
+                B_term = 0.
         else:
-            if self.scalar_B:
-                if self.log_B_tilde.numel() > 0:
-                    if diag:
-                        B_term = torch.exp(self.log_B_tilde[0]) * (1 - (Q**2).sum(dim=1))
-                    else:
-                        B_term = torch.exp(self.log_B_tilde[0]) * (torch.eye(self.n_tasks, device=self.log_B_tilde.device) - Q @ Q.T)
-                else:
-                    B_term = 0.
+            if self.diagonal_B:
+                B_tilde_root = torch.exp(self.log_B_tilde / 2)
+                B_term_root = Q_orth * B_tilde_root
+                if hasattr(self, "M"):
+                    B_tilde = B_tilde_root**2 * torch.broadcast_to(torch.eye(self.n_tasks - self.n_latents, device=self.log_B_tilde.device), (self.n_batch, 1, 1))
             else:
-                if self.diagonal_B:
-                    B_tilde_root = torch.diag_embed(torch.exp(self.log_B_tilde / 2))
-                else:
-                    B_tilde_root = torch.linalg.solve_triangular(self.B_tilde_inv_chol,
-                        torch.eye(self.n_tasks - self.n_latents, device=self.B_tilde_inv_chol.device), upper=False).T
+                identities = torch.broadcast_to(torch.eye(self.n_tasks - self.n_latents, device=self.B_tilde_inv_chol.device), (self.n_batch, 1, 1))
+                B_tilde_root = torch.linalg.solve_triangular(self.B_tilde_inv_chol, identities, upper=False).mT
                 B_term_root = Q_orth @ B_tilde_root
-                B_term = B_term_root @ B_term_root.T if not diag else (B_term_root**2).sum(dim=1)
+                if hasattr(self, "M"):
+                    B_tilde = B_tilde_root @ B_tilde_root.mT
+            B_term = B_term_root @ B_term_root.mT if not diag else (B_term_root**2).sum(dim=-1)
+
+        if hasattr(self, "M") and self.n_latents < self.n_tasks:
+            M_term = - QR @ (sigma_p * self.M) @ B_tilde @ Q_orth.mT
+            Mt_term = M_term.mT
+            D_term_rotated = torch.diag_embed(sigma_p) + sigma_p * self.M @ B_tilde @ self.M.mT * sigma_p
+            D_term = QR @ D_term_rotated @ QR.mT
+        else:
             M_term, Mt_term = 0., 0.
-            D_term_root = QR * torch.sqrt(sigma_p)[None,:]
-            D_term = D_term_root @ D_term_root.T if not diag else (D_term_root**2).sum(dim=1)
+            D_term_root = QR * torch.sqrt(sigma_p)
+            D_term = D_term_root @ D_term_root.mT if not diag else (D_term_root**2).sum(dim=-1)
 
         if diag:
-            res = gp.likelihoods.MultitaskGaussianLikelihood(num_tasks=self.n_tasks, rank=0, has_global_noise=False)
+            res = gp.likelihoods.MultitaskGaussianLikelihood(num_tasks=self.n_tasks, batch_shape=torch.Size([self.n_batch]),
+                                                             rank=0, has_global_noise=False)
             if sigma_p.is_cuda:
                 res.cuda()
             res.task_noises = B_term + D_term
         else:
-            res = gp.likelihoods.MultitaskGaussianLikelihood(num_tasks=self.n_tasks, rank=self.n_tasks, has_global_noise=False)
+            res = gp.likelihoods.MultitaskGaussianLikelihood(num_tasks=self.n_tasks,  batch_shape=torch.Size([self.n_batch]),
+                                                             rank=self.n_tasks, has_global_noise=False)
             if sigma_p.is_cuda:
                 res.cuda()
             Sigma = D_term + M_term + Mt_term + B_term
@@ -332,8 +357,9 @@ class ProjectedGPModel(ExactGPModel):
                 eps = self.jitter_val
                 while eps < 1e6 * self.jitter_val:
                     try:
-                        identity = torch.eye(self.n_tasks, dtype=res.task_noise_covar.dtype, device=res.task_noise_covar.device)
-                        res.task_noise_covar_factor.data = torch.linalg.cholesky(Sigma + eps*identity)
+                        identities = torch.broadcast_to(torch.eye(self.n_tasks, dtype=res.task_noise_covar.dtype,
+                                                          device=res.task_noise_covar.device), (self.n_batch, 1, 1))
+                        res.task_noise_covar_factor.data = torch.linalg.cholesky(Sigma + eps*identities)
                         break
                     except:
                         eps *= 10
@@ -350,7 +376,7 @@ class ProjectedGPModel(ExactGPModel):
             return torch.diag_embed(torch.exp(self.log_B_tilde))
         else:
             L_inv = torch.linalg.solve_triangular(self.B_tilde_inv_chol, torch.eye(self.n_tasks - self.n_latents), upper=False)
-            return L_inv.T @ L_inv
+            return L_inv.mT @ L_inv
 
     def forward( self, x:Tensor )-> gp.distributions.MultivariateNormal:  # ! forward only returns values of the latent processes !
         """
@@ -377,7 +403,7 @@ class ProjectedGPModel(ExactGPModel):
         proj_targets = self.project_data(self.train_y)
         super().set_train_data(inputs=self.train_inputs, targets=proj_targets, strict=False)
         batch_distrib = ExactGPModel.__call__(self, x, **kwargs)
-        return batch_distrib  # shape n_latents x n_points
+        return batch_distrib  # shape (n_batch x) n_latents x n_points
     
     def compute_loo(self, output=None, latent=False) -> Tuple[Tensor, Tensor]:
         """
@@ -389,6 +415,7 @@ class ProjectedGPModel(ExactGPModel):
         Returns:
             A tuple containing the LOO variances and error gaps for each task (each of size n_points x n_tasks, or n_points x n_latents if latent=True).
         """
+        # TODO : adapt to batch case
         train_x, train_y = self.train_inputs[0], self.train_y
         with torch.no_grad():
             if output is None:
@@ -399,11 +426,11 @@ class ProjectedGPModel(ExactGPModel):
             L = K.cholesky(upper=False)
             loo_var = 1.0 / L._cholesky_solve(identity[None,:], upper=False).diagonal(dim1=-1, dim2=-2)
             loo_delta = L._cholesky_solve(y_proj.unsqueeze(-1), upper=False).squeeze(-1) * loo_var
-            loo_var, loo_delta = loo_var.T, loo_delta.T
+            loo_var, loo_delta = loo_var.mT, loo_delta.mT
             if not latent:
                 lmc_coeffs = self.lmc_coefficients()
                 e_loo_raw = (loo_delta @ lmc_coeffs)
-                diff = (self.train_y - y_proj.T @ lmc_coeffs)
+                diff = (self.train_y - y_proj.mT @ lmc_coeffs)
                 loo_delta = e_loo_raw + diff
                 loo_var = loo_var @ lmc_coeffs**2
         return loo_var, loo_delta
@@ -539,10 +566,10 @@ class ProjectedLMCmll(gp.mlls.ExactMarginalLogLikelihood):
         num_data = latent_function_dist.event_shape.numel()
         
         # project the targets
-        proj_target = self.model.project_data(target) # shape n_latents x n_points
+        proj_target = self.model.project_data(target) # shape (n_batch x) n_latents x n_points
 
         # Get the log prob of the marginal distribution of latent processes
-        latent_output = self.likelihood(latent_function_dist, *params) # shape n_latents x n_points
+        latent_output = self.likelihood(latent_function_dist, *params) # shape (n_batch x) n_latents x n_points
         latent_res = latent_output.log_prob(proj_target)
         latent_res = self._add_other_terms(latent_res, params).sum().div_(num_data)  # Scale by the amount of data we have
 
@@ -566,7 +593,7 @@ class ProjectedLMCmll(gp.mlls.ExactMarginalLogLikelihood):
                 log_B_tilde_root_diag = self.model.log_B_tilde / 2
                 rot_proj_scaled_target = target @ Q_orth * torch.exp(- log_B_tilde_root_diag)
             else:
-                B_tilde_inv_root_diag = self.model.B_tilde_inv_chol[range(p-q), range(p-q)]
+                B_tilde_inv_root_diag = self.model.B_tilde_inv_chol[:, range(p-q), range(p-q)]
                 log_B_tilde_root_diag = -torch.log(B_tilde_inv_root_diag)
                 rot_proj_scaled_target = target @ Q_orth @ self.model.B_tilde_inv_chol
             self.proj_term_list[1] = - 0.5 * (rot_proj_scaled_target**2).sum().div_(num_data)
