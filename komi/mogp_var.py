@@ -58,6 +58,7 @@ class VariationalMultitaskGPModel(gp.models.ApproximateGP):
                  init_lmc_coeffs:bool=True,
                  noise_thresh:float=1e-4,
                  outputscales:bool=False, 
+                 batch_lik:bool=False,
                  prior_scales:Tensor=None,
                  prior_width:Tensor=None,
                  ker_kwargs:Union[dict,None]=None, 
@@ -81,7 +82,8 @@ class VariationalMultitaskGPModel(gp.models.ApproximateGP):
             init_lmc_coeffs: whether to initialize LMC coefficients with SVD of the training labels. If False, these coefficients are sampled from a normal distribution. Defaults to True.
             noise_thresh: minimum value for the noise parameter. Has a large impact for ill-conditioned kernel matrices, which is the case of the HXS application. Defaults to 1e-6.
             outputscales: whether to endow each latent kernel with a learned scaling factor, k(.) = a*k_base(.). This is only useful for predictive variance 
-            scaling, and may result in over-parametrization. Defaults to False
+            | scaling, and may result in over-parametrization. Defaults to False
+            batch_lik: if True, the likelihood will be a batch of gaussians instead of a multitask independent gaussian. May improve perf
             prior_scales: Prior mean for characteristic lengthscales of the kernel. Defaults to None.
             prior_width: Prior deviation-to-mean ratio for characteristic lengthscales of the kernel. Defaults to None.
             ker_kwargs: Additional arguments to pass to the gp kernel function. Defaults to None.
@@ -139,10 +141,14 @@ class VariationalMultitaskGPModel(gp.models.ApproximateGP):
 
         if likelihood is None:
             noise_init = 10 * noise_thresh
-            likelihood = gp.likelihoods.MultitaskGaussianLikelihood(num_tasks=n_tasks, batch_shape=multilik_batch_shape,
-                                                                    has_global_noise=False,
-                                                                    noise_constraint=gp.constraints.GreaterThan(noise_thresh))
-            likelihood.task_noises = torch.ones_like(likelihood.task_noises) * noise_init
+            if batch_lik :
+                likelihood = gp.likelihoods.GaussianLikelihood(batch_shape=output_batch_shape, noise_constraint=gp.constraints.GreaterThan(noise_thresh))
+                likelihood.noise = noise_init * torch.ones_like(likelihood.noise)
+            else:
+                likelihood = gp.likelihoods.MultitaskGaussianLikelihood(num_tasks=n_tasks, batch_shape=multilik_batch_shape,
+                                                                        has_global_noise=False,
+                                                                        noise_constraint=gp.constraints.GreaterThan(noise_thresh))
+                likelihood.task_noises = torch.ones_like(likelihood.task_noises) * noise_init
 
         self.likelihood = likelihood
         self.n_tasks = n_tasks
