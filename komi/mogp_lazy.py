@@ -37,22 +37,15 @@ class LazyLMCModel(ExactGPModel):
             and can be inputed to the compute_loo() method in any case. Default is False.
             jitter_val: jitter value added to the predictive covariance matrix of the model. Default is 1e-8.
         """
-        if len(train_y.shape) == 2:
-            n_points, n_tasks = train_y.shape
-            axes_layout = {'n_points':0, 'n_tasks':1}
-            latent_batch_shape = torch.Size([n_latents])
-            multilik_batch_shape = torch.Size()
-        elif len(train_y.shape) == 3:
-            n_batch, n_points, n_tasks = train_y.shape
-            axes_layout = {'n_batch':0, 'n_points':1, 'n_tasks':2}
-            latent_batch_shape = torch.Size([n_batch, n_latents])
-            multilik_batch_shape = torch.Size([n_batch])
+        *batch_shape, n_points, n_tasks = train_y.shape
+        latent_batch_shape = torch.Size([*batch_shape, n_latents])
+        multilik_batch_shape = torch.Size(batch_shape)
 
         proj_likelihood = gp.likelihoods.GaussianLikelihood(batch_shape=latent_batch_shape,
                                 noise_constraint=gp.constraints.GreaterThan(0.5 * noise_val))
         proj_likelihood.noise = noise_val
         
-        U, S, V = compute_truncated_svd(Y=train_y, n_latents=n_latents, axes_layout=axes_layout)
+        U, S, V = compute_truncated_svd(Y=train_y, n_latents=n_latents)
         lmc_coeffs = (U * S.unsqueeze(-2)).mT
         proj_y = V.mT
 
@@ -64,13 +57,12 @@ class LazyLMCModel(ExactGPModel):
         if store_full_y:
             self.register_buffer('train_y', train_y)
         self.full_lik = gp.likelihoods.MultitaskGaussianLikelihood(num_tasks=n_tasks, batch_shape=multilik_batch_shape,
+                                                                   has_global_noise=False,
                                                     noise_constraint=gp.constraints.GreaterThan(noise_val))
-        self.full_lik.noise = noise_val
         self.full_lik.task_noises = noise_val
         self.n_tasks = n_tasks
         self.n_latents = n_latents
         self.shape_batch = multilik_batch_shape
-        self.axes_layout = axes_layout
         self.noise_val = noise_val
         self.latent_dim = -1
         if jitter_val is None:

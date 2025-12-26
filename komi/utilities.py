@@ -385,24 +385,16 @@ def init_lmc_coefficients( train_y: Tensor, n_latents: int, QR_form:bool=False):
     return y_transformed.mT # shape (n_batch x) n_latents x n_tasks
 
 
-def compute_truncated_svd(Y: Tensor, n_latents: int, axes_layout:dict[str, int]):
+def compute_truncated_svd(Y: Tensor, n_latents: int):
     """
+    Input shape: (n_batch x) n_points x n_tasks
     Return shapes:
     U: (n_batch x) n_tasks x n_lat
     S: (n_batch x) n_lat
     V: (n_batch x) n_points x n_lat
     """
-    if len(axes_layout) != len(Y.shape):
-        raise ValueError("Provided axis layout ({0}) doesn't match the shape of the tensor to process: {1}".format(axes_layout, Y.shape))
-    axes_len = {axis_name : Y.shape[axis_index] for axis_name, axis_index in axes_layout.items()}
-    n_points = axes_len['n_points']
-    # Objective : get to (n_batch, n_tasks, n_points) or (n_tasks, n_points)
-    if 'n_batch' in axes_layout:
-        permut = tuple(axes_layout[axis_name] for axis_name in ('n_batch', 'n_tasks', 'n_points'))
-    else:
-        permut = tuple(axes_layout[axis_name] for axis_name in ('n_tasks', 'n_points'))
-
-    Y_reshaped = torch.permute(Y, permut)
+    Y_reshaped = Y.mT
+    n_points = Y_reshaped.shape[-1]
     if n_points >= n_latents:
         U, S, V = torch.svd_lowrank(Y_reshaped, q=n_latents)
     else:

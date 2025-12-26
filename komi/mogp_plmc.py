@@ -180,18 +180,10 @@ class ProjectedGPModel(ExactGPModel):
         if mean_type is not gp.means.ZeroMean:
             raise NotImplementedError('Projected GP model does not support non-zero output-wise means for now !')
 
-        if len(train_y.shape) == 2:
-            n_points, n_tasks = train_y.shape
-            axes_layout = {'n_points':0, 'n_tasks':1}
-            latent_batch_shape = torch.Size([n_latents])
-            discarded_noise_shape = torch.Size([n_tasks - n_latents])
-            batch_shape = torch.Size()
-        elif len(train_y.shape) == 3:
-            n_batch, n_points, n_tasks = train_y.shape
-            axes_layout = {'n_batch':0, 'n_points':1, 'n_tasks':2}
-            latent_batch_shape = torch.Size([n_batch, n_latents])
-            discarded_noise_shape = torch.Size([n_batch, n_tasks - n_latents])
-            batch_shape = torch.Size([n_batch])
+        *batch_shape, n_points, n_tasks = train_y.shape
+        latent_batch_shape = torch.Size([*batch_shape, n_latents])
+        discarded_noise_shape = torch.Size([*batch_shape, n_tasks - n_latents])
+        batch_shape = torch.Size(batch_shape)
 
         # Likelihood (noise model) initialization
         noise_init = 10 * noise_thresh
@@ -205,10 +197,10 @@ class ProjectedGPModel(ExactGPModel):
             
         # Initialization of LMC coefficients and projected data
         if scalar_B and BDN: # !!! Very structuring choice, corresponding to PLMC-fast ; see PLMC article
-            U, S, V = compute_truncated_svd(Y=train_y, n_latents=n_latents, axes_layout=axes_layout)
+            U, S, V = compute_truncated_svd(Y=train_y, n_latents=n_latents)
             R = S
         else:
-            U, S, V = compute_truncated_svd(Y=train_y, n_latents=n_tasks, axes_layout=axes_layout)
+            U, S, V = compute_truncated_svd(Y=train_y, n_latents=n_tasks)
             R = S[..., :n_latents]
         Q_plus = U
         proj_y = V.mT

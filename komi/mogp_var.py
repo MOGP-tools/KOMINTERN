@@ -93,20 +93,11 @@ class VariationalMultitaskGPModel(gp.models.ApproximateGP):
         if ker_kwargs is None:
             ker_kwargs = {}
 
+        *batch_shape, n_points, n_tasks = train_y.shape
+        latent_batch_shape = torch.Size([*batch_shape, n_latents])
+        output_batch_shape = torch.Size([*batch_shape, n_tasks])
+        multilik_batch_shape = torch.Size(batch_shape)
         _, dim = train_x.shape
-        if len(train_y.shape) == 2:
-            n_points, n_tasks = train_y.shape
-            axes_layout = {'n_points':0, 'n_tasks':1}
-            n_batch = 0
-            latent_batch_shape = torch.Size([n_latents])
-            output_batch_shape = torch.Size([n_tasks])
-            multilik_batch_shape = torch.Size()
-        elif len(train_y.shape) == 3:
-            n_batch, n_points, n_tasks = train_y.shape
-            axes_layout = {'n_batch':0, 'n_points':1, 'n_tasks':2}
-            latent_batch_shape = torch.Size([n_batch, n_latents])
-            output_batch_shape = torch.Size([n_batch, n_tasks])
-            multilik_batch_shape = torch.Size([n_batch])
 
         if float(train_ind_ratio) == 1.:
             warnings.warn('Caution : inducing points not learned !')
@@ -159,7 +150,7 @@ class VariationalMultitaskGPModel(gp.models.ApproximateGP):
         self.outputscales = outputscales
 
         if init_lmc_coeffs :
-            U, S, V = compute_truncated_svd(Y=train_y, n_latents=n_latents, axes_layout=axes_layout)
+            U, S, V = compute_truncated_svd(Y=train_y, n_latents=n_latents)
             S = S / np.sqrt(n_points - 1) # seems to work better, but is it justified ?
             lmc_coefficients = (U * S.unsqueeze(-2)).mT
             self.variational_strategy.lmc_coefficients = torch.nn.Parameter(lmc_coefficients)  #shape (n_batch x) n_latents x n_tasks

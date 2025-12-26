@@ -127,7 +127,7 @@ class FastProjectedGPModel(ExactGPModel):
             proj_likelihood.noise = noise_init * torch.ones_like(proj_likelihood.noise)
             
         # Initialization of LMC coefficients and projected data
-        U, S, V = compute_truncated_svd(Y=train_y, n_latents=n_latents, axes_layout=axes_layout)
+        U, S, V = compute_truncated_svd(Y=train_y, n_latents=n_latents)
         R = S
         Q = U
         proj_y = V.mT

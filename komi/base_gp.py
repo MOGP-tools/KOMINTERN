@@ -55,15 +55,10 @@ class ExactGPModel(gp.models.ExactGP):
         """
         if len(train_y.shape) == 1:
             train_y = train_y.view(1,-1) # add a task axis
-        if len(train_y.shape) == 2:
-            n_tasks, n_points = train_y.shape
-            n_batch = 0
-            batch_shape = torch.Size([n_tasks])
-            multilik_batch_shape = torch.Size()
-        elif len(train_y.shape) == 3:
-            n_batch, n_tasks, n_points = train_y.shape
-            batch_shape = torch.Size([n_batch, n_tasks])
-            multilik_batch_shape = torch.Size([n_batch])
+
+        *batch_shape, n_tasks, n_points = train_y.shape
+        batch_shape = torch.Size([*batch_shape, n_tasks])
+        multilik_batch_shape = torch.Size(batch_shape)
 
         batch_lik = batch_lik or batch_shape == (1,1)
         if likelihood is None:
