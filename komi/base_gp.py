@@ -11,7 +11,7 @@ from gpytorch.mlls.marginal_log_likelihood import MarginalLogLikelihood
 from gpytorch.models.exact_prediction_strategies import prediction_strategy
 from torch import Tensor
 
-from .utilities import handle_covar_ 
+from utilities import handle_covar_ , get_median_heuristic_ard
 
 class ExactGPModel(gp.models.ExactGP):
     """
@@ -62,7 +62,7 @@ class ExactGPModel(gp.models.ExactGP):
 
         batch_lik = batch_lik or batch_shape == (1,1)
         if likelihood is None:
-            noise_init = 10 * noise_thresh
+            noise_init = 1.
             if batch_lik :
                 likelihood = gp.likelihoods.GaussianLikelihood(batch_shape=batch_shape, noise_constraint=gp.constraints.GreaterThan(noise_thresh))
                 likelihood.noise = noise_init * torch.ones_like(likelihood.noise)
@@ -73,6 +73,10 @@ class ExactGPModel(gp.models.ExactGP):
                 likelihood.task_noises = torch.ones_like(likelihood.task_noises) * noise_init
                 
         super(ExactGPModel, self).__init__(train_x, train_y, likelihood)
+
+        # Initialization of the lenghtscales
+        if prior_scales is None:
+            prior_scales = get_median_heuristic_ard(X=train_x)
 
         if ker_kwargs is None:
             ker_kwargs = {}

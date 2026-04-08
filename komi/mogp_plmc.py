@@ -10,9 +10,9 @@ from gpytorch.likelihoods.likelihood import Likelihood
 from linear_operator.operators import KroneckerProductLinearOperator, RootLinearOperator
 from linear_operator.operators.dense_linear_operator import to_linear_operator
 
-from .utilities import init_lmc_coefficients, compute_truncated_svd, \
+from utilities import init_lmc_coefficients, compute_truncated_svd, get_median_heuristic_ard, \
     ScalarParam, PositiveDiagonalParam, LowerTriangularParam, UpperTriangularParam
-from .base_gp import ExactGPModel
+from base_gp import ExactGPModel
 
 ## making the mixing matrix a separate class allows to call torch.nn.utils.parametrizations.orthogonal
 ## onto it during instanciation of a ProjectedGPModel
@@ -186,7 +186,7 @@ class ProjectedGPModel(ExactGPModel):
         batch_shape = torch.Size(batch_shape)
 
         # Likelihood (noise model) initialization
-        noise_init = 10 * noise_thresh
+        noise_init = 1.
         if proj_likelihood is not None and proj_likelihood.noise.shape[-1] != n_latents:
             raise ValueError("In projected GP model the dimension of the likelihood is the number of latent processes. "
                   "Provided likelihood has length {0} while n_latents is {1}".format(proj_likelihood.noise.shape[-1], n_latents))
@@ -198,9 +198,11 @@ class ProjectedGPModel(ExactGPModel):
         # Initialization of LMC coefficients and projected data
         if scalar_B and BDN: # !!! Very structuring choice, corresponding to PLMC-fast ; see PLMC article
             U, S, V = compute_truncated_svd(Y=train_y, n_latents=n_latents)
+            S = S / np.sqrt(n_points) # because of Marchenko-Pastur Law
             R = S
         else:
             U, S, V = compute_truncated_svd(Y=train_y, n_latents=n_tasks)
+            S = S / np.sqrt(n_points) # because of Marchenko-Pastur Law
             R = S[..., :n_latents]
         Q_plus = U
         proj_y = V.mT
@@ -213,7 +215,7 @@ class ProjectedGPModel(ExactGPModel):
                 torch.nn.utils.parametrize.register_parametrization(lmc_coefficients, "R", PositiveDiagonalParam())
             else:
                 torch.nn.utils.parametrize.register_parametrization(lmc_coefficients, "R", UpperTriangularParam())
-
+                
         # Initialization of the latent processes
         super().__init__(train_x=train_x, train_y=proj_y, likelihood=proj_likelihood,
                          mean_type=gp.means.ZeroMean, outputscales=outputscales, batch_lik=True, **kwargs)

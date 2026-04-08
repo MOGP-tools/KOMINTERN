@@ -304,9 +304,7 @@ def handle_covar_( kernel: Kernel, dim: int, decomp: Union[List[List[int]], None
         disc_vars = []
 
     l_priors = [None] * len(decomp)
-    if prior_scales is not None:
-        if prior_width is None:
-            raise ValueError('A prior width should be provided if a prior mean is')
+    if prior_scales is not None and prior_width is not None:
         if type(prior_scales) is not list:  # 2 possible formats: an array with one length per variable, or a list with one array per kernel
             prior_scales = [prior_scales[idx_list] for idx_list in decomp]
         if type(prior_width) is not list:   # 2 possible formats: an array with one length per variable, or a list with one array per kernel
@@ -343,16 +341,13 @@ def handle_covar_( kernel: Kernel, dim: int, decomp: Union[List[List[int]], None
         covar_module *= gp.kernels.IndexKernel(num_tasks=n_vals, active_dims=var_location, rank=disc_ranks[i_disc], batch_shape=batch_shape)
 
     if prior_scales is not None and kernels[0].has_lengthscale:
-        try:
-            if len(decomp) > 1 :
-                for i_ker in range(len(kernels)):
-                        covar_module.kernels[i_ker].base_kernel.lengthscale = l_priors[i_ker].mean
-            elif outputscales:
-                covar_module.base_kernel.lengthscale = l_priors[0].mean
-            else:
-                covar_module.lengthscale = l_priors[0].mean
-        except:
-            raise ValueError('Provided prior scales were of the wrong shape')
+        if len(decomp) > 1 :
+            for i_ker in range(len(kernels)):
+                covar_module.kernels[i_ker].base_kernel.lengthscale = prior_scales[i_ker]
+        elif outputscales:
+            covar_module.base_kernel.lengthscale = prior_scales[0]
+        else:
+            covar_module.lengthscale = prior_scales[0]
 
     return covar_module
 
@@ -406,6 +401,41 @@ def compute_truncated_svd(Y: Tensor, n_latents: int):
         V = torch.ones_like(R.mT)
         V = V[..., :n_latents]
     return U, S, V
+
+def get_median_heuristic_ard(X, num_samples=1000):
+    """
+    Calculates the median distance between points along each dimension.
+    
+    Args:
+        X (np.ndarray or torch.Tensor): Training inputs of shape (n_points, n_dims).
+        num_samples (int): Max points to use for the calculation (prevents memory errors).
+        
+    Returns:
+        np.ndarray: Median distances of shape (n_dims,).
+    """
+    if torch.is_tensor(X):
+        X_np = X.detach().cpu().numpy()
+    else:
+        X_np = np.atleast_2d(X)
+        
+    n_points, n_dims = X_np.shape
+    
+    if n_points > num_samples:
+        indices = np.random.choice(n_points, num_samples, replace=False)
+        X_np = X_np[indices]
+        n_points = num_samples
+
+    median_dists = np.zeros(n_dims)
+
+    for d in range(n_dims):
+        x_d = X_np[:, d][:, np.newaxis]
+        dists = np.abs(x_d - x_d.T)
+        triu_indices = np.triu_indices(n_points, k=1)
+        pairwise_dists = dists[triu_indices]
+        m_val = np.median(pairwise_dists)
+        median_dists[d] = m_val if m_val > 0 else 1.0
+        
+    return median_dists
 
 ##----------------------------------------------------------------------------------------------------------------------
 

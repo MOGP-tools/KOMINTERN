@@ -8,9 +8,45 @@ import gpytorch as gp
 from gpytorch.means.mean import Mean
 from gpytorch.kernels.kernel import Kernel
 from gpytorch.likelihoods.likelihood import Likelihood
+from sklearn.cluster import KMeans
 from scipy.stats import qmc
 
-from .utilities import init_lmc_coefficients, handle_covar_, compute_truncated_svd
+from utilities import init_lmc_coefficients, handle_covar_, compute_truncated_svd, get_median_heuristic_ard
+
+def initialize_inducing_points(X:Tensor, M:int, with_qmc:bool, seed:int=0):
+    """
+    Initializes M inducing point locations using K-means clustering.
+    
+    Parameters:
+    X (ndarray or tensor): Training inputs of shape (n_points, n_dims)
+    M (int): Number of inducing points (clusters)
+    
+    Returns:
+    Z (ndarray): Initialized inducing point locations of shape (M, n_dims)
+    """
+    if hasattr(X, "detach"):
+        X_np = X.detach().cpu().numpy()
+    elif hasattr(X, "numpy"):
+        X_np = X.numpy()
+    else:
+        X_np = np.asarray(X)
+
+    if with_qmc:
+        dim = X.shape[-1]
+        sampler = qmc.LatinHypercube(d=dim, seed=seed)
+        locations = 2 * sampler.random(n=M) - 1
+    else:
+        # n_init='auto' is recommended for newer sklearn versions
+        # Use k-means++ for better initial centroid placement
+        kmeans = KMeans(n_clusters=M, n_init='auto', init='k-means++')
+        kmeans.fit(X_np)
+        locations = kmeans.cluster_centers_
+
+    if hasattr(X, "numpy"):
+        res = torch.as_tensor(locations, dtype=X.dtype, device=X.device)
+    else:
+        res = locations
+    return res
 
 class CustomLMCVariationalStrategy(gp.variational.LMCVariationalStrategy):
     """
@@ -56,6 +92,7 @@ class VariationalMultitaskGPModel(gp.models.ApproximateGP):
                  distrib:gp.variational._VariationalDistribution=gp.variational.CholeskyVariationalDistribution, 
                  var_strat:gp.variational._VariationalStrategy=gp.variational.VariationalStrategy,
                  init_lmc_coeffs:bool=True,
+                 init_induc_with_qmc:bool=False,
                  noise_thresh:float=1e-4,
                  outputscales:bool=False, 
                  batch_lik:bool=False,
@@ -99,6 +136,7 @@ class VariationalMultitaskGPModel(gp.models.ApproximateGP):
         multilik_batch_shape = torch.Size(batch_shape)
         _, dim = train_x.shape
 
+        # Initialization of variational quantities
         if float(train_ind_ratio) == 1.:
             warnings.warn('Caution : inducing points not learned !')
             inducing_points = train_x
@@ -108,8 +146,7 @@ class VariationalMultitaskGPModel(gp.models.ApproximateGP):
         else:
             learn_inducing_locations = True
             n_ind_points = int(np.floor(n_points / train_ind_ratio))
-            sampler = qmc.LatinHypercube(d=dim, seed=seed)
-            inducing_points = torch.as_tensor(2 * sampler.random(n=n_ind_points) - 1, dtype=train_x.dtype)
+            inducing_points = initialize_inducing_points(X=train_x, M=n_ind_points, with_qmc=init_induc_with_qmc, seed=seed)
             #same inducing points for all latents here
 
         variational_distribution = distrib(inducing_points.size(-2), batch_shape=latent_batch_shape)
@@ -126,12 +163,17 @@ class VariationalMultitaskGPModel(gp.models.ApproximateGP):
 
         super().__init__(variational_strategy)
 
+        # Initialization of the lenghtscales
+        if prior_scales is None:
+            prior_scales = get_median_heuristic_ard(X=train_x)
+
         self.covar_module = handle_covar_(kernel_type, dim=dim, decomp=decomp, disc_ranks=disc_ranks, prior_scales=prior_scales,
                             prior_width=prior_width, batch_shape=latent_batch_shape, ker_kwargs=ker_kwargs, outputscales=outputscales)
         self.mean_module = gp.means.ZeroMean(batch_shape=latent_batch_shape) #in gp, latent processes can have non-zero means, which we wish to avoid
 
+        # Initialization of the likelihood
         if likelihood is None:
-            noise_init = 10 * noise_thresh
+            noise_init = 1.
             if batch_lik :
                 likelihood = gp.likelihoods.GaussianLikelihood(batch_shape=output_batch_shape, noise_constraint=gp.constraints.GreaterThan(noise_thresh))
                 likelihood.noise = noise_init * torch.ones_like(likelihood.noise)
@@ -151,7 +193,7 @@ class VariationalMultitaskGPModel(gp.models.ApproximateGP):
 
         if init_lmc_coeffs :
             U, S, V = compute_truncated_svd(Y=train_y, n_latents=n_latents)
-            S = S / np.sqrt(n_points - 1) # seems to work better, but is it justified ?
+            S = S / np.sqrt(n_points) # because of Marchenko-Pastur Law
             lmc_coefficients = (U * S.unsqueeze(-2)).mT
             self.variational_strategy.lmc_coefficients = torch.nn.Parameter(lmc_coefficients)  #shape (n_batch x) n_latents x n_tasks
 
