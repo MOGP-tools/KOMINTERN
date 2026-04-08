@@ -147,8 +147,6 @@ class ProjectedGPModel(ExactGPModel):
                   ortho_param='matrix_exp',
                   mean_type:Mean=gp.means.ZeroMean,
                   noise_thresh:float=1e-4,
-                  outputscales:bool=False,
-                  jitter_val:Union[float,None]=None,
                   **kwargs):
         """Initialization of the model. Note that the optional arguments of the ExactGPModel (in particular the choice of 
         mean and kernel function) also apply here thanks to the inheritance.
@@ -174,13 +172,11 @@ class ProjectedGPModel(ExactGPModel):
             noise_thresh: minimum value for the noise parameter. Has a large impact for ill-conditioned kernel matrices, which is the case of the HXS application. Defaults to 1e-6.
             outputscales: whether to endow each latent kernel with a learned scaling factor, k(.) = a*k_base(.). This is only useful for predictive variance 
             scaling, and may result in over-parametrization. Defaults to False
-            jitter_val: jitter value for the Cholesky decomposition of the full noise covariance matrix, and for addition to the predictive covariance matrix.
-            If None, it is set to the default gpytorch Cholesky jitter setting. Defaults to None.
         """
         if mean_type is not gp.means.ZeroMean:
             raise NotImplementedError('Projected GP model does not support non-zero output-wise means for now !')
 
-        *batch_shape, n_points, n_tasks = train_y.shape
+        *batch_shape, n_tasks, n_points = train_y.shape
         latent_batch_shape = torch.Size([*batch_shape, n_latents])
         discarded_noise_shape = torch.Size([*batch_shape, n_tasks - n_latents])
         batch_shape = torch.Size(batch_shape)
@@ -203,7 +199,7 @@ class ProjectedGPModel(ExactGPModel):
         else:
             U, S, V = compute_truncated_svd(Y=train_y, n_latents=n_tasks)
             S = S / np.sqrt(n_points) # because of Marchenko-Pastur Law
-            R = S[..., :n_latents]
+            R, V = S[..., :n_latents], V[..., :n_latents]
         Q_plus = U
         proj_y = V.mT
         R = torch.diag_embed(R)
@@ -215,10 +211,10 @@ class ProjectedGPModel(ExactGPModel):
                 torch.nn.utils.parametrize.register_parametrization(lmc_coefficients, "R", PositiveDiagonalParam())
             else:
                 torch.nn.utils.parametrize.register_parametrization(lmc_coefficients, "R", UpperTriangularParam())
-                
+
         # Initialization of the latent processes
         super().__init__(train_x=train_x, train_y=proj_y, likelihood=proj_likelihood,
-                         mean_type=gp.means.ZeroMean, outputscales=outputscales, batch_lik=True, **kwargs)
+                         mean_type=gp.means.ZeroMean, batch_lik=True, **kwargs)
         # !! proj_likelihood will only be named likelihood in the model
         self.register_buffer('train_y', train_y)
         self.lmc_coefficients = lmc_coefficients
@@ -248,11 +244,6 @@ class ProjectedGPModel(ExactGPModel):
         self.n_latents = n_latents
         self.shape_batch = batch_shape
         self.latent_dim = -1
-        self.outputscales = outputscales
-        if jitter_val is None:
-            self.jitter_val = gp.settings.cholesky_jitter.value(train_x.dtype)
-        else:
-            self.jitter_val = jitter_val
 
 
     def projected_noise( self )-> Tensor:
@@ -281,16 +272,16 @@ class ProjectedGPModel(ExactGPModel):
         """
         Projects some data labels onto the latent space.
         Args:
-            data: data tensor of shape (n_batch x) n_points x n_tasks
+            data: data tensor of shape (n_batch x) n_tasks x n_points
         Returns:
             Projected data tensor of shape (n_batch x) n_latents x n_points.
             This shape convention corresponds to the batch treatment in gpytorch, not to the usual convention.
         """
         Q, R, Q_orth = self.lmc_coefficients.QR()
-        unscaled_proj = Q.mT @ data.mT
+        unscaled_proj = Q.mT @ data
         Hpinv_times_Y = torch.linalg.solve_triangular(R, unscaled_proj, upper=True)  
         if hasattr(self, "M"):
-            return Hpinv_times_Y + self.projected_noise() * self.M @ Q_orth.mT @ data.mT
+            return Hpinv_times_Y + self.projected_noise().unsqueeze(-1) * self.M @ Q_orth.mT @ data
         else:
             return Hpinv_times_Y # (n_batch x) shape n_latents x n_points ; opposite convention to most other quantities !!
 
@@ -573,6 +564,7 @@ class ProjectedLMCmll(gp.mlls.ExactMarginalLogLikelihood):
             raise RuntimeError("ExactMarginalLogLikelihood can only operate on Gaussian random variables")
 
         num_data = latent_function_dist.event_shape.numel()
+        transp_target = target.mT
         
         # project the targets
         proj_target = self.model.project_data(target) # shape (n_batch x) n_latents x n_points
@@ -593,7 +585,7 @@ class ProjectedLMCmll(gp.mlls.ExactMarginalLogLikelihood):
                 log_B_tilde = self.model.log_B_tilde
                 B_tilde_inv_val = torch.exp(- log_B_tilde[0])
                 log_B_tilde_root_diag = log_B_tilde / 2
-                self.proj_term_list[1] = B_tilde_inv_val * (self.model.Y_squared_norm - (target @ Q).pow(2).sum()).div_(num_data)
+                self.proj_term_list[1] = B_tilde_inv_val * (self.model.Y_squared_norm - (transp_target @ Q).pow(2).sum()).div_(num_data)
                 # the parenthesis is the squared norm of the projection of target onto the space orthogonal to span(Q)
             else:
                 self.proj_term_list[1] = 0.
@@ -601,11 +593,11 @@ class ProjectedLMCmll(gp.mlls.ExactMarginalLogLikelihood):
         else:
             if self.model.diagonal_B:
                 log_B_tilde_root_diag = self.model.log_B_tilde / 2
-                rot_proj_scaled_target = target @ Q_orth * torch.exp(- log_B_tilde_root_diag)
+                rot_proj_scaled_target = transp_target @ Q_orth * torch.exp(- log_B_tilde_root_diag)
             else:
                 B_tilde_inv_root_diag = self.model.B_tilde_inv_chol[..., range(p-q), range(p-q)]
                 log_B_tilde_root_diag = -torch.log(B_tilde_inv_root_diag)
-                rot_proj_scaled_target = target @ Q_orth @ self.model.B_tilde_inv_chol
+                rot_proj_scaled_target = transp_target @ Q_orth @ self.model.B_tilde_inv_chol
             self.proj_term_list[1] = (rot_proj_scaled_target**2).sum().div_(num_data)
 
         # All terms are implicitly or explicitly divided by the number of datapoints

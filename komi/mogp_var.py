@@ -48,6 +48,10 @@ def initialize_inducing_points(X:Tensor, M:int, with_qmc:bool, seed:int=0):
         res = locations
     return res
 
+class CustomVariationalELBO(gp.mlls.VariationalELBO):
+    def forward(self, variational_dist_f, target, **kwargs):
+        return super().forward(variational_dist_f, target.mT, **kwargs)
+    
 class CustomLMCVariationalStrategy(gp.variational.LMCVariationalStrategy):
     """
     This small overlay to the native LMCVariationalStrategy of gp allows to put deterministic mean functions on tasks rather than latent processes.
@@ -130,7 +134,7 @@ class VariationalMultitaskGPModel(gp.models.ApproximateGP):
         if ker_kwargs is None:
             ker_kwargs = {}
 
-        *batch_shape, n_points, n_tasks = train_y.shape
+        *batch_shape, n_tasks, n_points = train_y.shape
         latent_batch_shape = torch.Size([*batch_shape, n_latents])
         output_batch_shape = torch.Size([*batch_shape, n_tasks])
         multilik_batch_shape = torch.Size(batch_shape)
@@ -324,7 +328,7 @@ class VariationalMultitaskGPModel(gp.models.ApproximateGP):
         return dico
     
     def default_mll(self):
-        return gp.mlls.VariationalELBO(self.likelihood, self, num_data=self.n_points)
+        return CustomVariationalELBO(self.likelihood, self, num_data=self.n_points)
 
 
 

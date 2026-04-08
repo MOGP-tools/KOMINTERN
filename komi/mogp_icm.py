@@ -10,9 +10,9 @@ import gpytorch as gp
 from gpytorch.likelihoods.likelihood import Likelihood
 from linear_operator.operators import PsdSumLinearOperator, RootLinearOperator
 
-from .utilities import init_lmc_coefficients
-from .base_gp import ExactGPModel
-from .lowrank_multitask_kernel import LowrankMultitaskKernel
+from utilities import compute_truncated_svd
+from base_gp import ExactGPModel
+from lowrank_multitask_kernel import LowrankMultitaskKernel
 
 class MultitaskGPModel(ExactGPModel):
     """
@@ -23,11 +23,7 @@ class MultitaskGPModel(ExactGPModel):
                   train_y: Tensor,
                   n_latents: int, 
                   likelihood:Union[Likelihood,None]=None,
-                  fix_diagonal:bool=True,
-                  diag_value:float=16*torch.finfo(torch.get_default_dtype()).tiny, 
-                  noise_thresh:float=1e-4,
                   init_lmc_coeffs:bool=True,
-                  outputscales:bool=False,
                   model_type:str='ICM',
                   lowrank:bool=False,
                   **kwargs):
@@ -39,27 +35,16 @@ class MultitaskGPModel(ExactGPModel):
             train_y: Input labels
             n_latents: number of latent functions
             likelihood: gpytorch likelihood function for the outputs. If none is provided, a default MultitaskGaussianLikelihood is used. Defaults to None.
-            fix_diagonal: for ICM only. If True, fixes the learned diagonal term of the task covariance matrix, accounting for task-specific (non-shared)
-            latent processes. The efficient storage of the model (with a cache of size n_latents x n_points) is only possible if this diagonal term
-            is fixed to zero. Defaults to True.
-            diag_value: value of the diagonal term of the task covariance matrix if fix_diagonal is set to True. Defaults to machine precision.
             init_lmc_coeffs: whether to initialize LMC coefficients with SVD of the training labels. If False, these coefficients are sampled from a normal distribution. Defaults to True.
-            outputscales: whether to endow each latent kernel with a learned scaling factor, k(.) = a*k_base(.). This is only useful for predictive variance 
-            scaling, and may result in over-parametrization. Defaults to False
             model_type: choice between 'ICM' and 'LMC'. The latter is very computationnally-heavy and unstable, so it should only be used for very specific
             experimental purposes. Defaults to "ICM"
             lowrank: If True, the cross-task covariance matrix is low-rank. Defaults to False
         """
-        n_data, n_tasks = train_y.shape
-        noise_init = 10 * noise_thresh
-        if likelihood is None:
-            likelihood = gp.likelihoods.MultitaskGaussianLikelihood(num_tasks=n_tasks,
-                                                    noise_constraint=gp.constraints.GreaterThan(noise_thresh))
-            likelihood.noise = noise_init
-            likelihood.task_noises = torch.ones(n_tasks, device=train_y.device) * noise_init
-            
-        super(MultitaskGPModel, self).__init__(train_x, train_y, likelihood, n_tasks=1, outputscales=outputscales, **kwargs) # we build upon a single-task GP, created by calling parent class
+        *batch_shape, n_tasks, n_points = train_y.shape
 
+        super(MultitaskGPModel, self).__init__(train_x, train_y, likelihood, ignore_n_tasks=True, batch_lik=False, **kwargs)
+        # we build upon a single-task GP, created by calling parent class
+            
         self.mean_module = gp.means.MultitaskMean(self.mean_module, num_tasks=n_tasks)
         
         if model_type=='ICM':
@@ -72,7 +57,9 @@ class MultitaskGPModel(ExactGPModel):
                                                            num_tasks=n_tasks, rank=1)
 
         if init_lmc_coeffs:
-            lmc_coeffs = init_lmc_coefficients(train_y, n_latents).T
+            U, S, V = compute_truncated_svd(Y=train_y, n_latents=n_latents)
+            S = S / np.sqrt(n_points) # because of Marchenko-Pastur Law
+            lmc_coeffs = (U * S.unsqueeze(-2))
             if model_type=='ICM':
                 # this parameter has already been initialized with random values at the instantiation of the variational strategy, so registering it anew is facultative
                 self.covar_module.task_covar_module.register_parameter(name='covar_factor', parameter=torch.nn.Parameter(lmc_coeffs))
@@ -82,20 +69,9 @@ class MultitaskGPModel(ExactGPModel):
                     self.covar_module.covar_module_list[i].task_covar_module.covar_factor = torch.nn.Parameter(lmc_coeffs[:,i].unsqueeze(-1))
             else:
                 raise ValueError('Wrong specified model type, should be ICM or LMC')
-
-        if fix_diagonal:
-            if model_type=='ICM':
-                self.covar_module.task_covar_module.register_parameter(name='raw_var',
-                                            parameter=torch.nn.Parameter(np.log(diag_value)*torch.ones(n_tasks, device=train_y.device),
-                                            requires_grad=False))
-            elif model_type=='LMC':
-                for i in range(len(self.covar_module.covar_module_list)):
-                    self.covar_module.covar_module_list[i].task_covar_module.register_parameter(name='raw_var',
-                                                parameter=torch.nn.Parameter(np.log(diag_value)*torch.ones(n_tasks, device=train_y.device),
-                                                requires_grad=False))
                 
-        self.outputscales = outputscales
         self.n_tasks, self.n_latents, self.model_type = n_tasks, n_latents, model_type
+
 
     def lmc_coefficients( self )-> Tensor:
         """
@@ -108,7 +84,7 @@ class MultitaskGPModel(ExactGPModel):
             for i in range(self.n_latents):
                 res[i] = self.covar_module.covar_module_list[i].task_covar_module.covar_factor.data.squeeze()
         else:
-            res = self.covar_module.task_covar_module.covar_factor.data.squeeze().T
+            res = self.covar_module.task_covar_module.covar_factor.data.squeeze().mT
         return res
 
     def lscales( self, unpacked:bool=True)-> Union[List[Tensor], Tensor] :

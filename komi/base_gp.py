@@ -28,7 +28,8 @@ class ExactGPModel(gp.models.ExactGP):
                   outputscales:bool=False,
                   noise_thresh:float=1e-6,
                   n_inducing_points:Union[int,None]=None,
-                  batch_lik:bool=False,
+                  batch_lik:bool|None=None,
+                  ignore_n_tasks:bool=False,
                   prior_scales:Union[Tensor, None]=None,
                   prior_width:Union[Tensor, None]=None,
                   ker_kwargs:Union[dict,None]=None,
@@ -48,6 +49,7 @@ class ExactGPModel(gp.models.ExactGP):
             noise_thresh: minimum value for the noise parameter. Has a large impact for ill-conditioned kernel matrices, which is the case of the HXS application. Defaults to 1e-6.
             n_inducing_points: if an integer is provided, the model will use the sparse GP approximation of Titsias (2009) with this many inducing points. Defaults to None.
             batch_lik: whether to use a batch Gaussian likelihood, or a MultitaskGaussianLikelihood able to model cross-tasks correlatins. Only meaningful if n_tasks > 1. Defaults to False.
+            ignore_n_tasks: whether to neglect the tasks axis when building covariance. Useful for inheritance, when forming an ICM
             prior_scales: Prior mean for characteristic lengthscales of the kernel. Defaults to None.
             prior_width: Prior deviation-to-mean ratio for characteristic lengthscales of the kernel. Defaults to None.
             ker_kwargs: Additional arguments to pass to the gp kernel function. Defaults to None.
@@ -57,14 +59,19 @@ class ExactGPModel(gp.models.ExactGP):
             train_y = train_y.view(1,-1) # add a task axis
 
         *batch_shape, n_tasks, n_points = train_y.shape
-        batch_shape = torch.Size([*batch_shape, n_tasks])
+        if ignore_n_tasks:
+            output_batch_shape = torch.Size(batch_shape)
+        else:
+            output_batch_shape = torch.Size([*batch_shape, n_tasks])
+        lik_batch_shape = torch.Size([*batch_shape, n_tasks])
         multilik_batch_shape = torch.Size(batch_shape)
 
-        batch_lik = batch_lik or batch_shape == (1,1)
+        if batch_lik is None:
+            batch_lik = ( len(batch_shape) < 2 or batch_shape == (1,1) )
         if likelihood is None:
             noise_init = 1.
             if batch_lik :
-                likelihood = gp.likelihoods.GaussianLikelihood(batch_shape=batch_shape, noise_constraint=gp.constraints.GreaterThan(noise_thresh))
+                likelihood = gp.likelihoods.GaussianLikelihood(batch_shape=lik_batch_shape, noise_constraint=gp.constraints.GreaterThan(noise_thresh))
                 likelihood.noise = noise_init * torch.ones_like(likelihood.noise)
             else:
                 likelihood = gp.likelihoods.MultitaskGaussianLikelihood(num_tasks=n_tasks, batch_shape=multilik_batch_shape,
@@ -82,12 +89,11 @@ class ExactGPModel(gp.models.ExactGP):
             ker_kwargs = {}
         self.dim = train_x.shape[1]
         self.n_tasks = n_tasks
-        self.batch_shape = batch_shape
         self.batch_lik = batch_lik
-        self.mean_module = mean_type(input_size=self.dim, batch_shape=batch_shape)
+        self.mean_module = mean_type(input_size=self.dim, batch_shape=output_batch_shape)
         self.covar_module = handle_covar_(kernel_type, dim=self.dim, decomp=decomp, disc_ranks=disc_ranks,
                                           prior_scales=prior_scales, prior_width=prior_width, outputscales=outputscales,
-                                          batch_shape=batch_shape, ker_kwargs=ker_kwargs)
+                                          batch_shape=output_batch_shape, ker_kwargs=ker_kwargs)
         if n_inducing_points is not None:
             self.covar_module = gp.kernels.InducingPointKernel(self.covar_module, torch.randn(n_inducing_points, self.dim), likelihood)
         

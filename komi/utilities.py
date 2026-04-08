@@ -382,13 +382,13 @@ def init_lmc_coefficients( train_y: Tensor, n_latents: int, QR_form:bool=False):
 
 def compute_truncated_svd(Y: Tensor, n_latents: int):
     """
-    Input shape: (n_batch x) n_points x n_tasks
+    Input shape: (n_batch x) n_tasks x n_points
     Return shapes:
     U: (n_batch x) n_tasks x n_lat
     S: (n_batch x) n_lat
     V: (n_batch x) n_points x n_lat
     """
-    Y_reshaped = Y.mT
+    Y_reshaped = Y
     n_points = Y_reshaped.shape[-1]
     if n_points >= n_latents:
         U, S, V = torch.svd_lowrank(Y_reshaped, q=n_latents)
