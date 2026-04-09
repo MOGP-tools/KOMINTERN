@@ -182,7 +182,7 @@ class ProjectedGPModel(ExactGPModel):
         batch_shape = torch.Size(batch_shape)
 
         # Likelihood (noise model) initialization
-        noise_init = 1.
+        noise_init = 1e-0
         if proj_likelihood is not None and proj_likelihood.noise.shape[-1] != n_latents:
             raise ValueError("In projected GP model the dimension of the likelihood is the number of latent processes. "
                   "Provided likelihood has length {0} while n_latents is {1}".format(proj_likelihood.noise.shape[-1], n_latents))
@@ -233,7 +233,7 @@ class ProjectedGPModel(ExactGPModel):
             self.register_parameter("log_B_tilde", torch.nn.Parameter(log_init_noise * discarded_noise_tens))
             self.register_constraint("log_B_tilde", gp.constraints.GreaterThan(log_noise_thresh))
         else:
-            self.register_parameter("B_tilde_inv_chol", torch.nn.Parameter(torch.diag_embed(-log_init_noise * discarded_noise_tens)))
+            self.register_parameter("B_tilde_inv_chol", torch.nn.Parameter(torch.diag_embed(1 / noise_init * discarded_noise_tens)))
             torch.nn.utils.parametrize.register_parametrization(self, "B_tilde_inv_chol",
                                                         LowerTriangularParam(bounds=(log_noise_thresh, -log_noise_thresh)))
         if not BDN:
@@ -293,11 +293,11 @@ class ProjectedGPModel(ExactGPModel):
         """
         Q, R, Q_orth = self.lmc_coefficients.QR()
         QR = Q @ R
-        sigma_p = self.projected_noise().unsqueeze(-2)
+        sigma_p = self.projected_noise()
         discarded_noise_size = self.n_tasks - self.n_latents
-        if self.scalar_B:
-            if self.n_latents < self.n_tasks:
-                B_tilde = torch.exp(self.log_B_tilde[..., :1])
+        if self.n_latents < self.n_tasks:
+            if self.scalar_B:
+                B_tilde = torch.exp(self.log_B_tilde[..., :1]) # only take a scalar value, not the full vector
                 if diag:
                     B_term = B_tilde * (1 - (Q**2).sum(dim=-1))
                 else:
@@ -310,33 +310,35 @@ class ProjectedGPModel(ExactGPModel):
                         torch.eye(discarded_noise_size, device=self.log_B_tilde.device),
                         (*self.shape_batch, discarded_noise_size, discarded_noise_size))
             else:
-                B_term = 0.
+                if self.diagonal_B:
+                    B_tilde_root = torch.exp(self.log_B_tilde / 2)
+                    B_term_root = Q_orth * B_tilde_root
+                    if hasattr(self, "M"):
+                        B_tilde = B_tilde_root**2 * torch.broadcast_to(
+                                                        torch.eye(discarded_noise_size, device=self.log_B_tilde.device),
+                                                        (*self.shape_batch, discarded_noise_size, discarded_noise_size))
+                else:
+                    identities = torch.broadcast_to(
+                                    torch.eye(discarded_noise_size, device=self.B_tilde_inv_chol.device),
+                                    (*self.shape_batch, discarded_noise_size, discarded_noise_size))
+                    B_tilde_root = torch.linalg.solve_triangular(self.B_tilde_inv_chol, identities, upper=False).mT # TOSEE : is this mT legit ?
+                    B_term_root = Q_orth @ B_tilde_root
+                    if hasattr(self, "M"):
+                        B_tilde = B_tilde_root @ B_tilde_root.mT
+                B_term = B_term_root @ B_term_root.mT if not diag else (B_term_root**2).sum(dim=-1)
         else:
-            if self.diagonal_B:
-                B_tilde_root = torch.exp(self.log_B_tilde / 2)
-                B_term_root = Q_orth * B_tilde_root
-                if hasattr(self, "M"):
-                    B_tilde = B_tilde_root**2 * torch.broadcast_to(
-                                                    torch.eye(discarded_noise_size, device=self.log_B_tilde.device),
-                                                    (*self.shape_batch, discarded_noise_size, discarded_noise_size))
-            else:
-                identities = torch.broadcast_to(
-                                torch.eye(discarded_noise_size, device=self.B_tilde_inv_chol.device),
-                                (*self.shape_batch, discarded_noise_size, discarded_noise_size))
-                B_tilde_root = torch.linalg.solve_triangular(self.B_tilde_inv_chol, identities, upper=False).mT
-                B_term_root = Q_orth @ B_tilde_root
-                if hasattr(self, "M"):
-                    B_tilde = B_tilde_root @ B_tilde_root.mT
-            B_term = B_term_root @ B_term_root.mT if not diag else (B_term_root**2).sum(dim=-1)
+            B_term = 0.
 
         if hasattr(self, "M") and self.n_latents < self.n_tasks:
-            M_term = - QR @ (sigma_p * self.M) @ B_tilde @ Q_orth.mT
+            M_term = - QR @ (sigma_p.unsqueeze(-1) * self.M) @ B_tilde @ Q_orth.mT
             Mt_term = M_term.mT
-            D_term_rotated = torch.diag_embed(sigma_p) + sigma_p * self.M @ B_tilde @ self.M.mT * sigma_p
+            extra_D_term_root = sigma_p.unsqueeze(-1) * self.M @ B_tilde_root
+            extra_D_term = extra_D_term_root @ extra_D_term_root.mT
+            D_term_rotated = torch.diag_embed(sigma_p) + extra_D_term
             D_term = QR @ D_term_rotated @ QR.mT
         else:
             M_term, Mt_term = 0., 0.
-            D_term_root = QR * torch.sqrt(sigma_p)
+            D_term_root = QR * torch.sqrt(sigma_p.unsqueeze(-2))
             D_term = D_term_root @ D_term_root.mT if not diag else (D_term_root**2).sum(dim=-1)
 
         if diag:
@@ -609,5 +611,6 @@ class ProjectedLMCmll(gp.mlls.ExactMarginalLogLikelihood):
             # The diagonal of R is already parametrized with its logarithm (UpperTriangularParam or PositiveDiagParam)
         projection_term = sum(self.proj_term_list) + (p - q) * np.log(2*np.pi)
 
+        self.latent_res = latent_res
         res = latent_res - 0.5 * projection_term
         return res
