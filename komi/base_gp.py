@@ -11,7 +11,7 @@ from gpytorch.mlls.marginal_log_likelihood import MarginalLogLikelihood
 from gpytorch.models.exact_prediction_strategies import prediction_strategy
 from torch import Tensor
 
-from utilities import handle_covar_ , get_median_heuristic_ard
+from utilities import handle_covar_ , get_median_heuristic_ard, CustomMultitaskGaussianLikelihood
 
 class ExactGPModel(gp.models.ExactGP):
     """
@@ -29,6 +29,7 @@ class ExactGPModel(gp.models.ExactGP):
                   noise_thresh:float=1e-6,
                   n_inducing_points:Union[int,None]=None,
                   batch_lik:bool|None=None,
+                  lik_mat_rank:int=0,
                   ignore_n_tasks:bool=False,
                   prior_scales:Union[Tensor, None]=None,
                   prior_width:Union[Tensor, None]=None,
@@ -74,10 +75,13 @@ class ExactGPModel(gp.models.ExactGP):
                 likelihood = gp.likelihoods.GaussianLikelihood(batch_shape=lik_batch_shape, noise_constraint=gp.constraints.GreaterThan(noise_thresh))
                 likelihood.noise = noise_init * torch.ones_like(likelihood.noise)
             else:
-                likelihood = gp.likelihoods.MultitaskGaussianLikelihood(num_tasks=n_tasks, batch_shape=multilik_batch_shape,
+                likelihood = CustomMultitaskGaussianLikelihood(num_tasks=n_tasks, batch_shape=multilik_batch_shape,
                                                                         has_global_noise=False,
+                                                                        rank=lik_mat_rank,
                                                                         noise_constraint=gp.constraints.GreaterThan(noise_thresh))
                 likelihood.task_noises = torch.ones_like(likelihood.task_noises) * noise_init
+                if lik_mat_rank > 0:
+                    likelihood.task_noise_covar_factor = torch.nn.Parameter(torch.ones_like(likelihood.task_noise_covar_factor) * np.sqrt(noise_init))
                 
         super(ExactGPModel, self).__init__(train_x, train_y, likelihood)
 

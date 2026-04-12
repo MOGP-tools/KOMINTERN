@@ -11,7 +11,7 @@ from gpytorch.likelihoods.likelihood import Likelihood
 from sklearn.cluster import KMeans
 from scipy.stats import qmc
 
-from utilities import init_lmc_coefficients, handle_covar_, compute_truncated_svd, get_median_heuristic_ard
+from utilities import handle_covar_, compute_truncated_svd, get_median_heuristic_ard, CustomMultitaskGaussianLikelihood
 
 def initialize_inducing_points(X:Tensor, M:int, with_qmc:bool, seed:int=0):
     """
@@ -100,6 +100,7 @@ class VariationalMultitaskGPModel(gp.models.ApproximateGP):
                  noise_thresh:float=1e-4,
                  outputscales:bool=False, 
                  batch_lik:bool=False,
+                 lik_mat_rank:int=0,
                  prior_scales:Tensor=None,
                  prior_width:Tensor=None,
                  ker_kwargs:Union[dict,None]=None, 
@@ -182,10 +183,13 @@ class VariationalMultitaskGPModel(gp.models.ApproximateGP):
                 likelihood = gp.likelihoods.GaussianLikelihood(batch_shape=output_batch_shape, noise_constraint=gp.constraints.GreaterThan(noise_thresh))
                 likelihood.noise = noise_init * torch.ones_like(likelihood.noise)
             else:
-                likelihood = gp.likelihoods.MultitaskGaussianLikelihood(num_tasks=n_tasks, batch_shape=multilik_batch_shape,
+                likelihood = CustomMultitaskGaussianLikelihood(num_tasks=n_tasks, batch_shape=multilik_batch_shape,
                                                                         has_global_noise=False,
+                                                                        rank=lik_mat_rank,
                                                                         noise_constraint=gp.constraints.GreaterThan(noise_thresh))
                 likelihood.task_noises = torch.ones_like(likelihood.task_noises) * noise_init
+                if lik_mat_rank > 0:
+                    likelihood.task_noise_covar_factor = torch.nn.Parameter(torch.ones_like(likelihood.task_noise_covar_factor) * np.sqrt(noise_init))
 
         self.likelihood = likelihood
         self.n_tasks = n_tasks

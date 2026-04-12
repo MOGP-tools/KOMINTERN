@@ -492,3 +492,151 @@ class LowerTriangularParam(torch.nn.Module):
         res = A
         res[range(len(res)), range(len(res))] = torch.log(res[range(len(res)), range(len(res))])
         return res
+
+##----------------------------------------------------------------------------
+# Custom multitask likelihood
+from typing import Optional, Any
+from gpytorch.likelihoods.multitask_gaussian_likelihood import MultitaskGaussianLikelihood
+from gpytorch.likelihoods.likelihood import Likelihood
+from gpytorch.priors.prior import Prior
+from gpytorch.constraints import GreaterThan
+from linear_operator import to_linear_operator
+from linear_operator.operators import (
+    ConstantDiagLinearOperator,
+    DiagLinearOperator,
+    KroneckerProductDiagLinearOperator,
+    KroneckerProductLinearOperator,
+    LinearOperator,
+    RootLinearOperator,
+)
+
+class CustomMultitaskGaussianLikelihood(MultitaskGaussianLikelihood):
+    """
+    Contrary to the MultitaskGaussianLikelihood of gpytorch, this one can have both a task_covar_factor and additional on-diagonal task_noises
+    """
+
+    def __init__(
+        self,
+        num_tasks: int,
+        rank: int = 0,
+        batch_shape: torch.Size = torch.Size(),
+        task_prior: Optional[Prior] = None,
+        noise_prior: Optional[Prior] = None,
+        noise_constraint: Optional[Interval] = None,
+        has_global_noise: bool = True,
+        has_task_noise: bool = True,
+    ) -> None:
+        super(Likelihood, self).__init__()  # pyre-ignore[20]
+        if noise_constraint is None:
+            noise_constraint = GreaterThan(1e-4)
+
+        if not has_task_noise and not has_global_noise:
+            raise ValueError(
+                "At least one of has_task_noise or has_global_noise must be specified. "
+                "Attempting to specify a likelihood that has no noise terms."
+            )
+
+        if has_task_noise:
+            self.register_parameter(
+                name="raw_task_noises", parameter=torch.nn.Parameter(torch.zeros(*batch_shape, num_tasks))
+            )
+            self.register_constraint("raw_task_noises", noise_constraint)
+            if noise_prior is not None:
+                self.register_prior("raw_task_noises_prior", noise_prior, lambda m: m.task_noises)
+
+            if rank == 0:
+                if task_prior is not None:
+                    raise RuntimeError("Cannot set a `task_prior` if rank=0")
+            else:
+                self.register_parameter(
+                    name="task_noise_covar_factor",
+                    parameter=torch.nn.Parameter(torch.randn(*batch_shape, num_tasks, rank)),
+                )
+                if task_prior is not None:
+                    self.register_prior("MultitaskErrorCovariancePrior", task_prior, lambda m: m._eval_covar_matrix)
+        self.num_tasks = num_tasks
+        self.rank = rank
+
+        if has_global_noise:
+            self.register_parameter(name="raw_noise", parameter=torch.nn.Parameter(torch.zeros(*batch_shape, 1)))
+            self.register_constraint("raw_noise", noise_constraint)
+            if noise_prior is not None:
+                self.register_prior("raw_noise_prior", noise_prior, lambda m: m.noise)
+
+        self.has_global_noise = has_global_noise
+        self.has_task_noise = has_task_noise
+
+    @property
+    def task_noises(self) -> Optional[Tensor]:
+        if self.has_task_noise:
+            return self.raw_task_noises_constraint.transform(self.raw_task_noises)
+        else:
+            raise AttributeError("Cannot set diagonal task noises if the likelihood only has a global noise")
+
+    @task_noises.setter
+    def task_noises(self, value: Union[float, Tensor]) -> None:
+        self._set_task_noises(value)
+
+    @property
+    def task_noise_covar(self) -> Tensor:
+        if self.rank > 0:
+            D = torch.diag_embed(self.task_noises)
+            return self.task_noise_covar_factor.matmul(self.task_noise_covar_factor.transpose(-1, -2)) + D
+        else:
+            raise AttributeError("Cannot retrieve task noises when covariance is diagonal.")
+
+    @task_noise_covar.setter
+    def task_noise_covar(self, value: Tensor) -> None:
+        # internally uses a pivoted cholesky decomposition to construct a low rank
+        # approximation of the covariance
+        if not self.has_task_noise:
+            raise AttributeError("Cannot set task noise covar if the likelihood only has a global noise")
+        if self.rank > 0:
+            with torch.no_grad():
+                value_minus_diag = value - torch.diag_embed(self.task_noises)
+                self.task_noise_covar_factor.data = to_linear_operator(value_minus_diag).pivoted_cholesky(rank=self.rank)
+        else:
+            raise AttributeError("Cannot set non-diagonal task noises when covariance is diagonal.")
+
+    def _eval_covar_matrix(self) -> Tensor:
+        covar_factor = self.task_noise_covar_factor
+        noise = self.noise
+        D = noise * torch.eye(self.num_tasks, dtype=noise.dtype, device=noise.device)  # pyre-fixme[16]
+        return covar_factor.matmul(covar_factor.transpose(-1, -2)) + D + torch.diag_embed(self.task_noises)
+
+    def _shaped_noise_covar(
+        self, shape: torch.Size, add_noise: Optional[bool] = True, interleaved: bool = True, *params: Any, **kwargs: Any
+    ) -> LinearOperator:
+        if not self.has_task_noise:
+            noise = ConstantDiagLinearOperator(self.noise, diag_shape=shape[-2] * self.num_tasks)
+            return noise
+
+        task_noises = self.raw_task_noises_constraint.transform(self.raw_task_noises)
+        task_var_lt = DiagLinearOperator(task_noises)
+        dtype, device = task_noises.dtype, task_noises.device
+        if self.rank > 0:
+            task_noise_covar_factor = self.task_noise_covar_factor
+            task_var_lt += RootLinearOperator(task_noise_covar_factor)
+            ckl_init = KroneckerProductLinearOperator
+        else:
+            ckl_init = KroneckerProductDiagLinearOperator
+
+        eye_lt = ConstantDiagLinearOperator(
+            torch.ones(*shape[:-2], 1, dtype=dtype, device=device), diag_shape=shape[-2]
+        )
+        task_var_lt = task_var_lt.expand(*shape[:-2], *task_var_lt.matrix_shape)  # pyre-ignore[6]
+
+        # to add the latent noise we exploit the fact that
+        # I \kron D_T + \sigma^2 I_{NT} = I \kron (D_T + \sigma^2 I)
+        # which allows us to move the latent noise inside the task dependent noise
+        # thereby allowing exploitation of Kronecker structure in this likelihood.
+        if add_noise and self.has_global_noise:
+            noise = ConstantDiagLinearOperator(self.noise, diag_shape=task_var_lt.shape[-1])
+            task_var_lt = task_var_lt + noise
+
+        if interleaved:
+            covar_kron_lt = ckl_init(eye_lt, task_var_lt)
+        else:
+            covar_kron_lt = ckl_init(task_var_lt, eye_lt)
+
+        return covar_kron_lt

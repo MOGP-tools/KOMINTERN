@@ -52,6 +52,7 @@ class MultitaskGPModel(ExactGPModel):
                 self.covar_module = LowrankMultitaskKernel(self.covar_module, num_tasks=n_tasks, rank=n_latents)
             else:
                 self.covar_module = gp.kernels.MultitaskKernel(self.covar_module, num_tasks=n_tasks, rank=n_latents)
+            self.covar_module.task_covar_module.var = torch.tensor([1.])
         elif model_type=='LMC':
             self.covar_module = gp.kernels.LCMKernel(base_kernels=[copy.deepcopy(self.covar_module) for i in range(n_latents)],
                                                            num_tasks=n_tasks, rank=1)
@@ -62,7 +63,7 @@ class MultitaskGPModel(ExactGPModel):
             lmc_coeffs = (U * S.unsqueeze(-2))
             if model_type=='ICM':
                 # this parameter has already been initialized with random values at the instantiation of the variational strategy, so registering it anew is facultative
-                self.covar_module.task_covar_module.register_parameter(name='covar_factor', parameter=torch.nn.Parameter(lmc_coeffs))
+                self.covar_module.task_covar_module.covar_factor = torch.nn.Parameter(lmc_coeffs)
             elif model_type=='LMC':
                 for i in range(n_latents):
                     # this parameter has already been initialized with random values at the instantiation of the variational strategy, so registering it anew is facultative
