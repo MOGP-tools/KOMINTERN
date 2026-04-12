@@ -1,18 +1,67 @@
 from functools import reduce #, lru_cache
-from typing import Union, List, Tuple
+from typing import Union, List, Tuple, Any, Optional
 import warnings
 import numpy as np
 import torch
 from torch import Tensor
 import gpytorch as gp
+from gpytorch.constraints import Interval, GreaterThan
+from gpytorch.priors import Prior
 from gpytorch.means.mean import Mean
 from gpytorch.likelihoods.likelihood import Likelihood
-from linear_operator.operators import KroneckerProductLinearOperator, RootLinearOperator
+from gpytorch.likelihoods.multitask_gaussian_likelihood import _MultitaskGaussianLikelihoodBase
+from linear_operator.operators import KroneckerProductLinearOperator, RootLinearOperator, ConstantDiagLinearOperator, DenseLinearOperator, LinearOperator
 from linear_operator.operators.dense_linear_operator import to_linear_operator
 
-from utilities import init_lmc_coefficients, compute_truncated_svd, get_median_heuristic_ard, \
-    ScalarParam, PositiveDiagonalParam, LowerTriangularParam, UpperTriangularParam
+from utilities import compute_truncated_svd, ScalarParam, PositiveDiagonalParam, LowerTriangularParam, UpperTriangularParam
 from base_gp import ExactGPModel
+
+class NonfactoredMultitaskGaussianLikelihood(_MultitaskGaussianLikelihoodBase):
+    """
+    This class represents a multitask likelihood very similar to gpytorch's MultitaskGaussianLikelihood, but the task part of the covariance
+    | is stored as a full matrix rather than a root. Global noise and taskwise diagonal noise are not available here.
+    """
+    has_global_noise = False
+    
+    def __init__(
+        self,
+        num_tasks: int,
+        task_noise_covar: Optional[Tensor] = None,
+        batch_shape: torch.Size = torch.Size(),
+        noise_constraint: Optional[Interval] = None,
+    ) -> None:
+        super(Likelihood, self).__init__()  # pyre-ignore[20]
+        if noise_constraint is None:
+            noise_constraint = GreaterThan(1e-4)
+
+        if task_noise_covar is None:
+            task_noise_covar = torch.randn(*batch_shape, num_tasks, num_tasks)
+        self.register_parameter(
+            name="task_noise_covar",
+            parameter=torch.nn.Parameter(task_noise_covar),
+        )
+        self.num_tasks = num_tasks
+
+    def _shaped_noise_covar(
+        self, shape: torch.Size, interleaved: bool = True, *params: Any, **kwargs: Any
+    ) -> LinearOperator:
+        
+        task_var_lt = DenseLinearOperator(self.task_noise_covar)
+        dtype, device = self.task_noise_covar.dtype, self.task_noise_covar.device
+        ckl_init = KroneckerProductLinearOperator
+
+        eye_lt = ConstantDiagLinearOperator(
+            torch.ones(*shape[:-2], 1, dtype=dtype, device=device), diag_shape=shape[-2]
+        )
+        task_var_lt = task_var_lt.expand(*shape[:-2], *task_var_lt.matrix_shape)  # pyre-ignore[6]
+
+        if interleaved:
+            covar_kron_lt = ckl_init(eye_lt, task_var_lt)
+        else:
+            covar_kron_lt = ckl_init(task_var_lt, eye_lt)
+
+        return covar_kron_lt
+    
 
 ## making the mixing matrix a separate class allows to call torch.nn.utils.parametrizations.orthogonal
 ## onto it during instanciation of a ProjectedGPModel
@@ -236,8 +285,11 @@ class ProjectedGPModel(ExactGPModel):
             self.register_parameter("B_tilde_inv_chol", torch.nn.Parameter(torch.diag_embed(1 / noise_init * discarded_noise_tens)))
             torch.nn.utils.parametrize.register_parametrization(self, "B_tilde_inv_chol",
                                                         LowerTriangularParam(bounds=(log_noise_thresh, -log_noise_thresh)))
-        if not BDN:
+        if not BDN and n_tasks > n_latents:
             self.register_parameter("M", torch.nn.Parameter(torch.zeros([*batch_shape, n_latents, n_tasks - n_latents])))
+            self._has_M_term = True
+        else:
+            self._has_M_term = False
 
         self.diagonal_B, self.scalar_B = diagonal_B, scalar_B
         self.n_tasks = n_tasks
@@ -263,7 +315,7 @@ class ProjectedGPModel(ExactGPModel):
         """
         Q, R, Q_orth = self.lmc_coefficients.QR()
         H_pinv = torch.linalg.solve_triangular(R.mT, Q, upper=False, left=False)  # shape (n_batch x) n_tasks x n_latents
-        if hasattr(self, "M"):
+        if self._has_M_term:
             return H_pinv + Q_orth @ self.M.mT * self.projected_noise()
         else:
             return H_pinv
@@ -280,12 +332,12 @@ class ProjectedGPModel(ExactGPModel):
         Q, R, Q_orth = self.lmc_coefficients.QR()
         unscaled_proj = Q.mT @ data
         Hpinv_times_Y = torch.linalg.solve_triangular(R, unscaled_proj, upper=True)  
-        if hasattr(self, "M"):
+        if self._has_M_term:
             return Hpinv_times_Y + self.projected_noise().unsqueeze(-1) * self.M @ Q_orth.mT @ data
         else:
             return Hpinv_times_Y # (n_batch x) shape n_latents x n_points ; opposite convention to most other quantities !!
 
-    def full_likelihood( self, diag=False ) -> gp.likelihoods.MultitaskGaussianLikelihood:
+    def full_likelihood( self, diag=False ) -> gp.likelihoods.MultitaskGaussianLikelihood | NonfactoredMultitaskGaussianLikelihood :
         """
         Outputs the task-level likelihood of the model (Sigma matrix from the reference article), including the noise of the latent processes and the discarded noise.
         Returns:
@@ -305,7 +357,7 @@ class ProjectedGPModel(ExactGPModel):
                         torch.eye(self.n_tasks, device=self.log_B_tilde.device),
                         (*self.shape_batch, self.n_tasks, self.n_tasks))
                     B_term = torch.broadcast_to(B_tilde.unsqueeze(-1), identities.shape) * (identities - Q @ Q.mT)
-                if hasattr(self, "M"):
+                if self._has_M_term:
                     B_tilde = B_tilde * torch.broadcast_to(
                         torch.eye(discarded_noise_size, device=self.log_B_tilde.device),
                         (*self.shape_batch, discarded_noise_size, discarded_noise_size))
@@ -313,7 +365,7 @@ class ProjectedGPModel(ExactGPModel):
                 if self.diagonal_B:
                     B_tilde_root = torch.exp(self.log_B_tilde / 2)
                     B_term_root = Q_orth * B_tilde_root
-                    if hasattr(self, "M"):
+                    if self._has_M_term:
                         B_tilde = B_tilde_root**2 * torch.broadcast_to(
                                                         torch.eye(discarded_noise_size, device=self.log_B_tilde.device),
                                                         (*self.shape_batch, discarded_noise_size, discarded_noise_size))
@@ -323,21 +375,20 @@ class ProjectedGPModel(ExactGPModel):
                                     (*self.shape_batch, discarded_noise_size, discarded_noise_size))
                     B_tilde_root = torch.linalg.solve_triangular(self.B_tilde_inv_chol, identities, upper=False).mT # TOSEE : is this mT legit ?
                     B_term_root = Q_orth @ B_tilde_root
-                    if hasattr(self, "M"):
+                    if self._has_M_term:
                         B_tilde = B_tilde_root @ B_tilde_root.mT
                 B_term = B_term_root @ B_term_root.mT if not diag else (B_term_root**2).sum(dim=-1)
         else:
             B_term = 0.
 
-        if hasattr(self, "M") and self.n_latents < self.n_tasks:
+        if self._has_M_term:
             M_term = - QR @ (sigma_p.unsqueeze(-1) * self.M) @ B_tilde @ Q_orth.mT
-            Mt_term = M_term.mT
             extra_D_term_root = sigma_p.unsqueeze(-1) * self.M @ B_tilde_root
             extra_D_term = extra_D_term_root @ extra_D_term_root.mT
             D_term_rotated = torch.diag_embed(sigma_p) + extra_D_term
             D_term = QR @ D_term_rotated @ QR.mT
         else:
-            M_term, Mt_term = 0., 0.
+            M_term = 0.
             D_term_root = QR * torch.sqrt(sigma_p.unsqueeze(-2))
             D_term = D_term_root @ D_term_root.mT if not diag else (D_term_root**2).sum(dim=-1)
 
@@ -346,26 +397,15 @@ class ProjectedGPModel(ExactGPModel):
                                                              rank=0, has_global_noise=False)
             if sigma_p.is_cuda:
                 res.cuda()
-            res.task_noises = B_term + D_term
+            diag_M_term = torch.diagonal(M_term, dim1=-2, dim2=-1) if self._has_M_term else 0. 
+            res.task_noises = B_term + D_term + 2 * diag_M_term
         else:
-            res = gp.likelihoods.MultitaskGaussianLikelihood(num_tasks=self.n_tasks, batch_shape=self.shape_batch,
-                                                             rank=self.n_tasks, has_global_noise=False)
+            Mt_term = M_term.mT if self._has_M_term else 0.
+            Sigma = D_term + M_term + Mt_term + B_term
+            res = NonfactoredMultitaskGaussianLikelihood(num_tasks=self.n_tasks, batch_shape=self.shape_batch, task_noise_covar=Sigma)
             if sigma_p.is_cuda:
                 res.cuda()
-            Sigma = D_term + M_term + Mt_term + B_term
-            # We use a while loop to ensure that the full noise covariance is positive definite.
-            # We can deactivate gradient computation as loss computation does not involve the full likelihood
-            with torch.no_grad(): 
-                eps = self.jitter_val
-                while eps < 1e6 * self.jitter_val:
-                    try:
-                        identities = torch.broadcast_to(torch.eye(self.n_tasks, dtype=res.task_noise_covar.dtype,
-                                        device=res.task_noise_covar.device), (*self.shape_batch, self.n_tasks, self.n_tasks))
-                        res.task_noise_covar_factor.data = torch.linalg.cholesky(Sigma + eps*identities)
-                        break
-                    except:
-                        eps *= 10
-                        warnings.warn("Cholesky of the full noise covariance failed. Trying again with jitter {0} ...".format(eps))
+
         return res
 
     def B_tilde( self )-> Tensor:
@@ -475,7 +515,7 @@ class ProjectedGPModel(ExactGPModel):
                     dico['Sigma_orth'] = torch.exp(self.log_B_tilde).tolist()
                 else:
                     dico['Sigma_orth'] = self.B_tilde_inv_chol.tolist()
-                if hasattr(self, 'M'):
+                if self._has_M_term:
                     dico['M'] = self.M.tolist()
             else:
                 dico['lmc_coeffs'] = self.lmc_coefficients().tolist()
@@ -581,7 +621,7 @@ class ProjectedLMCmll(gp.mlls.ExactMarginalLogLikelihood):
         self.proj_term_list = [0]*3
         ## We store the additional terms in a list attribute in order to be able to plot them individually for testing
         Q, R, Q_orth = self.model.lmc_coefficients.QR()
-        if not hasattr(self.model, 'M') and self.model.scalar_B: # case of the PLMC-fast
+        if not self.model._has_M_term and self.model.scalar_B: # case of the PLMC-fast
             if self.model.log_B_tilde.numel() > 0:
                 # log_B_tilde = torch.clamp(self.model.log_B_tilde, -9, 9)
                 log_B_tilde = self.model.log_B_tilde
