@@ -337,7 +337,7 @@ class ProjectedGPModel(ExactGPModel):
         else:
             return Hpinv_times_Y # (n_batch x) shape n_latents x n_points ; opposite convention to most other quantities !!
 
-    def full_likelihood( self, diag=False ) -> gp.likelihoods.MultitaskGaussianLikelihood | NonfactoredMultitaskGaussianLikelihood :
+    def full_likelihood( self, diag=False ) -> Union[gp.likelihoods.MultitaskGaussianLikelihood, NonfactoredMultitaskGaussianLikelihood] :
         """
         Outputs the task-level likelihood of the model (Sigma matrix from the reference article), including the noise of the latent processes and the discarded noise.
         Returns:

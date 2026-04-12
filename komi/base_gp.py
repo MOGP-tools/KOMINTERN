@@ -28,7 +28,7 @@ class ExactGPModel(gp.models.ExactGP):
                   outputscales:bool=False,
                   noise_thresh:float=1e-6,
                   n_inducing_points:Union[int,None]=None,
-                  batch_lik:bool|None=None,
+                  batch_lik:Union[bool,None]=None,
                   lik_mat_rank:int=0,
                   ignore_n_tasks:bool=False,
                   prior_scales:Union[Tensor, None]=None,
