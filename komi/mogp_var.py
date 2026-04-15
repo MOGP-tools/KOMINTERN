@@ -189,7 +189,7 @@ class VariationalMultitaskGPModel(gp.models.ApproximateGP):
                                                                         noise_constraint=gp.constraints.GreaterThan(noise_thresh))
                 likelihood.task_noises = torch.ones_like(likelihood.task_noises) * noise_init
                 if lik_mat_rank > 0:
-                    likelihood.task_noise_covar_factor = torch.nn.Parameter(torch.ones_like(likelihood.task_noise_covar_factor) * np.sqrt(noise_init))
+                    likelihood.task_noise_covar_factor = torch.nn.Parameter(torch.zeros_like(likelihood.task_noise_covar_factor))
 
         self.likelihood = likelihood
         self.n_tasks = n_tasks

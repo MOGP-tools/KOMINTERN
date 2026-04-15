@@ -26,7 +26,7 @@ class ExactGPModel(gp.models.ExactGP):
                   decomp:Union[List[List[int]], None]=None,
                   disc_ranks:Tuple[int,...]=(),
                   outputscales:bool=False,
-                  noise_thresh:float=1e-6,
+                  noise_thresh:float=1e-4,
                   n_inducing_points:Union[int,None]=None,
                   batch_lik:Union[bool,None]=None,
                   lik_mat_rank:int=0,
@@ -81,7 +81,7 @@ class ExactGPModel(gp.models.ExactGP):
                                                                         noise_constraint=gp.constraints.GreaterThan(noise_thresh))
                 likelihood.task_noises = torch.ones_like(likelihood.task_noises) * noise_init
                 if lik_mat_rank > 0:
-                    likelihood.task_noise_covar_factor = torch.nn.Parameter(torch.ones_like(likelihood.task_noise_covar_factor) * np.sqrt(noise_init))
+                    likelihood.task_noise_covar_factor = torch.nn.Parameter(torch.zeros_like(likelihood.task_noise_covar_factor))
                 
         super(ExactGPModel, self).__init__(train_x, train_y, likelihood)
 
