@@ -352,6 +352,7 @@ class ProjectedGPModel(ExactGPModel):
             res = Hpinv_times_Y
         return res  # (n_batch x) shape n_latents x n_points
 
+
     def full_likelihood( self, diag=False ) -> Union[gp.likelihoods.MultitaskGaussianLikelihood, NonfactoredMultitaskGaussianLikelihood] :
         """
         Outputs the task-level likelihood of the model (Sigma matrix from the reference article), including the noise of the latent processes and the discarded noise.
@@ -361,34 +362,24 @@ class ProjectedGPModel(ExactGPModel):
         Q, R, Q_orth = self.lmc_coefficients.QR()
         QR = Q @ R
         sigma_p = self.projected_noise()
-        discarded_noise_size = self.n_tasks - self.n_latents
+        B_tilde_root = self.B_tilde_root
+        
         if self.n_latents < self.n_tasks:
             if self.scalar_B:
-                B_tilde = torch.exp(self.log_B_tilde[..., 0]) # only take a scalar value, not the full vector
+                B_tilde = B_tilde_root[..., :1] ** 2 # Only taske the scalar value, not the full vector (but same number of dimensions) 
                 if diag:
                     B_term = B_tilde * (1 - (Q**2).sum(dim=-1))
                 else:
                     identities = torch.broadcast_to(
-                        torch.eye(self.n_tasks, device=self.log_B_tilde.device),
+                        torch.eye(self.n_tasks, device=B_tilde.device),
                         (*self.shape_batch, self.n_tasks, self.n_tasks))
-                    B_term = B_tilde.unsqueeze(-1).unsqueeze(-1) * (identities - Q @ Q.mT)
-                if self._has_M_term:
-                    B_tilde = B_tilde * torch.broadcast_to(
-                        torch.eye(discarded_noise_size, device=self.log_B_tilde.device),
-                        (*self.shape_batch, discarded_noise_size, discarded_noise_size))
+                    B_term = B_tilde.unsqueeze(-1) * (identities - Q @ Q.mT)
             else:
                 if self.diagonal_B:
-                    B_tilde_root = torch.exp(self.log_B_tilde / 2)
                     B_term_root = Q_orth * B_tilde_root
                     if self._has_M_term:
-                        B_tilde = B_tilde_root**2 * torch.broadcast_to(
-                                                        torch.eye(discarded_noise_size, device=self.log_B_tilde.device),
-                                                        (*self.shape_batch, discarded_noise_size, discarded_noise_size))
+                        B_tilde = (B_tilde_root ** 2)# shape (*batch_shape) x (n_tasks - n_lat)
                 else:
-                    identities = torch.broadcast_to(
-                                    torch.eye(discarded_noise_size, device=self.B_tilde_inv_chol.device),
-                                    (*self.shape_batch, discarded_noise_size, discarded_noise_size))
-                    B_tilde_root = torch.linalg.solve_triangular(self.B_tilde_inv_chol, identities, upper=False).mT # TOSEE : is this mT legit ?
                     B_term_root = Q_orth @ B_tilde_root
                     if self._has_M_term:
                         B_tilde = B_tilde_root @ B_tilde_root.mT
@@ -397,8 +388,12 @@ class ProjectedGPModel(ExactGPModel):
             B_term = 0.
 
         if self._has_M_term:
-            M_term = - QR @ (sigma_p.unsqueeze(-1) * self.M) @ B_tilde @ Q_orth.mT
-            extra_D_term_root = sigma_p.unsqueeze(-1) * self.M @ B_tilde_root
+            if self.diagonal_B:
+                M_term = - QR @ ((sigma_p.unsqueeze(-1) * self.M) * B_tilde) @ Q_orth.mT
+                extra_D_term_root = sigma_p.unsqueeze(-1) * self.M * B_tilde_root
+            else:
+                M_term = - QR @ (sigma_p.unsqueeze(-1) * self.M) @ B_tilde @ Q_orth.mT
+                extra_D_term_root = sigma_p.unsqueeze(-1) * self.M @ B_tilde_root
             extra_D_term = extra_D_term_root @ extra_D_term_root.mT
             D_term_rotated = torch.diag_embed(sigma_p) + extra_D_term
             D_term = QR @ D_term_rotated @ QR.mT
@@ -423,17 +418,25 @@ class ProjectedGPModel(ExactGPModel):
 
         return res
 
-    def B_tilde( self )-> Tensor:
+    @property
+    def B_tilde_root( self )-> Tensor:
         """
-        Outputs the discarded noise factor B_tilde from the reference paper. 
+        Outputs the root of the discarded noise factor B_tilde from the reference paper. 
         Returns:
-            Discarded noise factor B_tilde (see reference paper), symmetric or diagonal matrix of size (n_tasks - n_latents).
-        """        
-        if self.diagonal_B:
-            return torch.diag_embed(torch.exp(self.log_B_tilde))
+            Root of discarded noise factor B_tilde (see reference paper), symmetric or diagonal matrix of size (n_tasks - n_latents).
+            In the diagonal case, only the diagonal is returned (not its square embedding)
+        """
+        if self.n_latents < self.n_tasks:
+            if self.diagonal_B:
+                res = torch.exp(self.log_B_tilde / 2)
+            else:
+                discarded_noise_size = self.n_tasks - self.n_latents
+                identities = torch.broadcast_to(torch.eye(discarded_noise_size, device=self.B_tilde_inv_chol.device),
+                                    (*self.shape_batch, discarded_noise_size, discarded_noise_size))
+                res = torch.linalg.solve_triangular(self.B_tilde_inv_chol, identities, upper=False).mT # TOSEE : is this mT legit ?
         else:
-            L_inv = torch.linalg.solve_triangular(self.B_tilde_inv_chol, torch.eye(self.n_tasks - self.n_latents), upper=False)
-            return L_inv.mT @ L_inv
+            res = torch.Tensor()
+        return res
 
     def forward( self, x:Tensor )-> gp.distributions.MultivariateNormal:  # ! forward only returns values of the latent processes !
         """
