@@ -644,3 +644,25 @@ class CustomMultitaskGaussianLikelihood(MultitaskGaussianLikelihood):
             covar_kron_lt = ckl_init(task_var_lt, eye_lt)
 
         return covar_kron_lt
+    
+##-----------------------------------------------------------------------------------------------
+class CorrectReduceLROnPlateau(torch.optim.lr_scheduler.ReduceLROnPlateau):
+    """
+    torch's ReduceLROnPlateau has incorrect behavior in relative mode when the loss is negative : the sign in 1.0 +/- self.threshold is wrong
+    (see https://github.com/pytorch/pytorch/issues/47513)
+    """
+    def _is_better(self, a, best):  # noqa: D102
+        if self.mode == "min" and self.threshold_mode == "rel":
+            rel_epsilon = 1.0 - self.threshold if best > 0. else 1.0 + self.threshold
+            return a < best * rel_epsilon
+
+        elif self.mode == "min" and self.threshold_mode == "abs":
+            return a < best - self.threshold
+
+        elif self.mode == "max" and self.threshold_mode == "rel":
+            rel_epsilon = self.threshold + 1.0 if best > 0. else 1.0 - self.threshold
+            return a > best * rel_epsilon
+
+        else:  # mode == 'max' and epsilon_mode == 'abs':
+            return a > best + self.threshold
+
