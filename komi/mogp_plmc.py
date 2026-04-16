@@ -104,7 +104,7 @@ class LMCMixingMatrix(torch.nn.Module):
         self.diagonal_R = diagonal_R
         if bulk:
             if self.mode=='Q_plus':
-                R_padded = torch.broadcast_to(torch.eye(self.n_tasks), (*self.shape_batch, self.n_tasks, self.n_tasks))
+                R_padded = torch.broadcast_to(torch.eye(self.n_tasks), (*self.shape_batch, self.n_tasks, self.n_tasks)).clone()
                 R_padded[..., :self.n_latents, :self.n_latents] = R
                 H = Q_plus @ R_padded
             else:
@@ -189,13 +189,14 @@ class ProjectedGPModel(ExactGPModel):
                   n_latents:int,
                   proj_likelihood:Union[None,Likelihood]=None, 
                   BDN:bool=True,
-                  diagonal_B:bool=False,
+                  diagonal_B:bool=True,
                   scalar_B:bool=False,
                   diagonal_R:bool=False,
                   bulk=True,
                   ortho_param='matrix_exp',
                   mean_type:Mean=gp.means.ZeroMean,
                   noise_thresh:float=1e-4,
+                  last_target_dim_is_datapoint:bool=False,
                   **kwargs):
         """Initialization of the model. Note that the optional arguments of the ExactGPModel (in particular the choice of 
         mean and kernel function) also apply here thanks to the inheritance.
@@ -225,13 +226,16 @@ class ProjectedGPModel(ExactGPModel):
         if mean_type is not gp.means.ZeroMean:
             raise NotImplementedError('Projected GP model does not support non-zero output-wise means for now !')
 
-        *batch_shape, n_tasks, n_points = train_y.shape
+        if last_target_dim_is_datapoint:
+            *batch_shape, n_tasks, n_points = train_y.shape
+        else:
+            *batch_shape, n_points, n_tasks = train_y.shape
         latent_batch_shape = torch.Size([*batch_shape, n_latents])
         discarded_noise_shape = torch.Size([*batch_shape, n_tasks - n_latents])
         batch_shape = torch.Size(batch_shape)
 
         # Likelihood (noise model) initialization
-        noise_init = 1e-0
+        noise_init = 1e-1
         if proj_likelihood is not None and proj_likelihood.noise.shape[-1] != n_latents:
             raise ValueError("In projected GP model the dimension of the likelihood is the number of latent processes. "
                   "Provided likelihood has length {0} while n_latents is {1}".format(proj_likelihood.noise.shape[-1], n_latents))
@@ -242,11 +246,11 @@ class ProjectedGPModel(ExactGPModel):
             
         # Initialization of LMC coefficients and projected data
         if scalar_B and BDN: # !!! Very structuring choice, corresponding to PLMC-fast ; see PLMC article
-            U, S, V = compute_truncated_svd(Y=train_y, n_latents=n_latents)
+            U, S, V = compute_truncated_svd(Y=train_y, n_latents=n_latents, last_target_dim_is_datapoint=last_target_dim_is_datapoint)
             S = S / np.sqrt(n_points) # because of Marchenko-Pastur Law
             R = S
         else:
-            U, S, V = compute_truncated_svd(Y=train_y, n_latents=n_tasks)
+            U, S, V = compute_truncated_svd(Y=train_y, n_latents=n_tasks, last_target_dim_is_datapoint=last_target_dim_is_datapoint)
             S = S / np.sqrt(n_points) # because of Marchenko-Pastur Law
             R, V = S[..., :n_latents], V[..., :n_latents]
         Q_plus = U
@@ -262,9 +266,10 @@ class ProjectedGPModel(ExactGPModel):
                 torch.nn.utils.parametrize.register_parametrization(lmc_coefficients, "R", UpperTriangularParam())
 
         # Initialization of the latent processes
-        super().__init__(train_x=train_x, train_y=proj_y, likelihood=proj_likelihood,
+        super().__init__(train_x=train_x, train_y=proj_y, likelihood=proj_likelihood, last_target_dim_is_datapoint=True,
                          mean_type=gp.means.ZeroMean, batch_lik=True, **kwargs)
-        # !! proj_likelihood will only be named likelihood in the model
+        # !! The latent processes always have the datapoint axis as last dim
+        # !! The projected likelihood will only be named likelihood in the model. The task-level one is self.full_likelihood()
         self.register_buffer('train_y', train_y)
         self.lmc_coefficients = lmc_coefficients
 
@@ -296,6 +301,7 @@ class ProjectedGPModel(ExactGPModel):
         self.n_latents = n_latents
         self.shape_batch = batch_shape
         self.latent_dim = -1
+        self.last_target_dim_is_datapoint = last_target_dim_is_datapoint
 
 
     def projected_noise( self )-> Tensor:
@@ -320,7 +326,7 @@ class ProjectedGPModel(ExactGPModel):
         else:
             return H_pinv
 
-    def project_data( self, data ) -> Tensor:
+    def project_data( self, data:Tensor, last_data_dim_is_datapoint:bool=False ) -> Tensor:
         """
         Projects some data labels onto the latent space.
         Args:
@@ -330,12 +336,21 @@ class ProjectedGPModel(ExactGPModel):
             This shape convention corresponds to the batch treatment in gpytorch, not to the usual convention.
         """
         Q, R, Q_orth = self.lmc_coefficients.QR()
-        unscaled_proj = Q.mT @ data
-        Hpinv_times_Y = torch.linalg.solve_triangular(R, unscaled_proj, upper=True)  
-        if self._has_M_term:
-            return Hpinv_times_Y + self.projected_noise().unsqueeze(-1) * self.M @ Q_orth.mT @ data
+        if last_data_dim_is_datapoint:
+            unscaled_proj = Q.mT @ data
         else:
-            return Hpinv_times_Y # (n_batch x) shape n_latents x n_points ; opposite convention to most other quantities !!
+            unscaled_proj = (data @ Q).mT
+        Hpinv_times_Y = torch.linalg.solve_triangular(R, unscaled_proj, upper=True)
+
+        if self._has_M_term:
+            if last_data_dim_is_datapoint:
+                orthog_proj = Q_orth.mT @ data
+            else:
+                orthog_proj = (data @ Q_orth).mT
+            res = Hpinv_times_Y + self.projected_noise().unsqueeze(-1) * self.M @ orthog_proj
+        else:
+            res = Hpinv_times_Y
+        return res  # (n_batch x) shape n_latents x n_points
 
     def full_likelihood( self, diag=False ) -> Union[gp.likelihoods.MultitaskGaussianLikelihood, NonfactoredMultitaskGaussianLikelihood] :
         """
@@ -349,14 +364,14 @@ class ProjectedGPModel(ExactGPModel):
         discarded_noise_size = self.n_tasks - self.n_latents
         if self.n_latents < self.n_tasks:
             if self.scalar_B:
-                B_tilde = torch.exp(self.log_B_tilde[..., :1]) # only take a scalar value, not the full vector
+                B_tilde = torch.exp(self.log_B_tilde[..., 0]) # only take a scalar value, not the full vector
                 if diag:
                     B_term = B_tilde * (1 - (Q**2).sum(dim=-1))
                 else:
                     identities = torch.broadcast_to(
                         torch.eye(self.n_tasks, device=self.log_B_tilde.device),
                         (*self.shape_batch, self.n_tasks, self.n_tasks))
-                    B_term = torch.broadcast_to(B_tilde.unsqueeze(-1), identities.shape) * (identities - Q @ Q.mT)
+                    B_term = B_tilde.unsqueeze(-1).unsqueeze(-1) * (identities - Q @ Q.mT)
                 if self._has_M_term:
                     B_tilde = B_tilde * torch.broadcast_to(
                         torch.eye(discarded_noise_size, device=self.log_B_tilde.device),
@@ -442,7 +457,7 @@ class ProjectedGPModel(ExactGPModel):
         Returns:
             A batched gp multivariate normal distribution representing latent processes values, which mean has shape n_latents x n_points.
         """
-        proj_targets = self.project_data(self.train_y)
+        proj_targets = self.project_data(self.train_y, last_data_dim_is_datapoint=self.last_target_dim_is_datapoint)
         super().set_train_data(inputs=self.train_inputs, targets=proj_targets, strict=False)
         batch_distrib = ExactGPModel.__call__(self, x, **kwargs)
         return batch_distrib  # shape (n_batch x) n_latents x n_points
@@ -478,12 +493,15 @@ class ProjectedGPModel(ExactGPModel):
         return loo_var, loo_delta
 
 
-    def set_train_data( self, inputs:Tensor, targets:Tensor, strict:bool=True ):
+    def set_train_data( self, inputs:Tensor, targets:Tensor, strict:bool=True, last_target_dim_is_datapoint:Union[bool, None]=None):
         """
         Replaces the current training data of the model. Overrides the parent method to store the training labels in the model.
         """
-        super().set_train_data(inputs=inputs, targets=self.project_data(targets), strict=strict)
-        self.train_y = targets
+        if last_target_dim_is_datapoint is None:
+            last_target_dim_is_datapoint = self.last_target_dim_is_datapoint
+        projected_data = self.project_data(targets, last_data_dim_is_datapoint=last_target_dim_is_datapoint)
+        super().set_train_data(inputs=inputs, targets=projected_data, strict=strict)
+        self.train_y = targets if self.last_target_dim_is_datapoint == last_target_dim_is_datapoint else targets.mT
 
     
     def save( self, extra_terms=False) -> dict:
@@ -541,7 +559,8 @@ class ProjectedGPModel(ExactGPModel):
         if self.training: # in training mode, we just compute the prior distribution of latent processes
             return super().__call__(x, **kwargs)
         
-        super().set_train_data(inputs=self.train_inputs, targets=self.project_data(self.train_y), strict=False)
+        projected_data = self.project_data(self.train_y, last_data_dim_is_datapoint=self.last_target_dim_is_datapoint)
+        super().set_train_data(inputs=self.train_inputs, targets=projected_data, strict=False)
         latent_dist = ExactGPModel.__call__(self, x, **kwargs)
 
         num_batch = len(latent_dist.batch_shape)
@@ -573,7 +592,7 @@ class ProjectedLMCmll(gp.mlls.ExactMarginalLogLikelihood):
     """
     The loss function for the ProjectedGPModel. 
     """
-    def __init__(self, latent_likelihood:Likelihood, model:ProjectedGPModel):
+    def __init__(self, latent_likelihood:Likelihood, model:ProjectedGPModel, last_target_dim_is_datapoint:Union[bool, None]=None):
         """
 
         Args:
@@ -587,6 +606,9 @@ class ProjectedLMCmll(gp.mlls.ExactMarginalLogLikelihood):
             raise RuntimeError("Likelihood must be Gaussian for exact inference")
         super(ProjectedLMCmll, self).__init__(latent_likelihood, model)
         self.previous_lat = None
+        if last_target_dim_is_datapoint is None:
+            last_target_dim_is_datapoint = model.last_target_dim_is_datapoint
+        self.last_target_dim_is_datapoint = last_target_dim_is_datapoint
 
 
     def forward(self, latent_function_dist:gp.distributions.Distribution, target:Tensor, inputs=None, *params) -> Tensor:
@@ -605,11 +627,12 @@ class ProjectedLMCmll(gp.mlls.ExactMarginalLogLikelihood):
         if not isinstance(latent_function_dist, gp.distributions.multivariate_normal.MultivariateNormal):
             raise RuntimeError("ExactMarginalLogLikelihood can only operate on Gaussian random variables")
 
+        if self.last_target_dim_is_datapoint:
+            target = target.mT
         num_data = latent_function_dist.event_shape.numel()
-        transp_target = target.mT
         
         # project the targets
-        proj_target = self.model.project_data(target) # shape (n_batch x) n_latents x n_points
+        proj_target = self.model.project_data(target, last_data_dim_is_datapoint=False) # shape (n_batch x) n_latents x n_points
 
         # Get the log prob of the marginal distribution of latent processes
         latent_output = self.likelihood(latent_function_dist, *params) # shape (n_batch x) n_latents x n_points
@@ -623,11 +646,10 @@ class ProjectedLMCmll(gp.mlls.ExactMarginalLogLikelihood):
         Q, R, Q_orth = self.model.lmc_coefficients.QR()
         if not self.model._has_M_term and self.model.scalar_B: # case of the PLMC-fast
             if self.model.log_B_tilde.numel() > 0:
-                # log_B_tilde = torch.clamp(self.model.log_B_tilde, -9, 9)
                 log_B_tilde = self.model.log_B_tilde
-                B_tilde_inv_val = torch.exp(- log_B_tilde[0])
+                B_tilde_inv_val = torch.exp(- log_B_tilde[..., 0])
                 log_B_tilde_root_diag = log_B_tilde / 2
-                self.proj_term_list[1] = B_tilde_inv_val * (self.model.Y_squared_norm - (transp_target @ Q).pow(2).sum()).div_(num_data)
+                self.proj_term_list[1] = ( B_tilde_inv_val * (self.model.Y_squared_norm - (target @ Q).pow(2)) ).sum().div_(num_data)
                 # the parenthesis is the squared norm of the projection of target onto the space orthogonal to span(Q)
             else:
                 self.proj_term_list[1] = 0.
@@ -635,11 +657,11 @@ class ProjectedLMCmll(gp.mlls.ExactMarginalLogLikelihood):
         else:
             if self.model.diagonal_B:
                 log_B_tilde_root_diag = self.model.log_B_tilde / 2
-                rot_proj_scaled_target = transp_target @ Q_orth * torch.exp(- log_B_tilde_root_diag)
+                rot_proj_scaled_target = target @ Q_orth * torch.exp(- log_B_tilde_root_diag)
             else:
                 B_tilde_inv_root_diag = self.model.B_tilde_inv_chol[..., range(p-q), range(p-q)]
                 log_B_tilde_root_diag = -torch.log(B_tilde_inv_root_diag)
-                rot_proj_scaled_target = transp_target @ Q_orth @ self.model.B_tilde_inv_chol
+                rot_proj_scaled_target = target @ Q_orth @ self.model.B_tilde_inv_chol
             self.proj_term_list[1] = (rot_proj_scaled_target**2).sum().div_(num_data)
 
         # All terms are implicitly or explicitly divided by the number of datapoints

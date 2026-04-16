@@ -30,6 +30,7 @@ class ExactGPModel(gp.models.ExactGP):
                   n_inducing_points:Union[int,None]=None,
                   batch_lik:Union[bool,None]=None,
                   lik_mat_rank:int=0,
+                  last_target_dim_is_datapoint:bool=False,
                   ignore_n_tasks:bool=False,
                   prior_scales:Union[Tensor, None]=None,
                   prior_width:Union[Tensor, None]=None,
@@ -59,7 +60,11 @@ class ExactGPModel(gp.models.ExactGP):
         if len(train_y.shape) == 1:
             train_y = train_y.view(1,-1) # add a task axis
 
-        *batch_shape, n_tasks, n_points = train_y.shape
+        if last_target_dim_is_datapoint:
+            *batch_shape, n_tasks, n_points = train_y.shape
+        else:
+            *batch_shape, n_points, n_tasks = train_y.shape
+            
         if ignore_n_tasks:
             output_batch_shape = torch.Size(batch_shape)
         else:
@@ -91,7 +96,7 @@ class ExactGPModel(gp.models.ExactGP):
 
         if ker_kwargs is None:
             ker_kwargs = {}
-        self.dim = train_x.shape[1]
+        self.dim = train_x.shape[-1]
         self.n_tasks = n_tasks
         self.batch_lik = batch_lik
         self.mean_module = mean_type(input_size=self.dim, batch_shape=output_batch_shape)

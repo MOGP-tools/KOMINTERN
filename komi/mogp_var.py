@@ -48,7 +48,7 @@ def initialize_inducing_points(X:Tensor, M:int, with_qmc:bool, seed:int=0):
         res = locations
     return res
 
-class CustomVariationalELBO(gp.mlls.VariationalELBO):
+class TransposedVariationalELBO(gp.mlls.VariationalELBO):
     def forward(self, variational_dist_f, target, **kwargs):
         return super().forward(variational_dist_f, target.mT, **kwargs)
     
@@ -101,6 +101,7 @@ class VariationalMultitaskGPModel(gp.models.ApproximateGP):
                  outputscales:bool=False, 
                  batch_lik:bool=False,
                  lik_mat_rank:int=0,
+                 last_target_dim_is_datapoint:bool=False,
                  prior_scales:Tensor=None,
                  prior_width:Tensor=None,
                  ker_kwargs:Union[dict,None]=None, 
@@ -135,7 +136,10 @@ class VariationalMultitaskGPModel(gp.models.ApproximateGP):
         if ker_kwargs is None:
             ker_kwargs = {}
 
-        *batch_shape, n_tasks, n_points = train_y.shape
+        if last_target_dim_is_datapoint:
+            *batch_shape, n_tasks, n_points = train_y.shape
+        else:
+            *batch_shape, n_points, n_tasks = train_y.shape
         latent_batch_shape = torch.Size([*batch_shape, n_latents])
         output_batch_shape = torch.Size([*batch_shape, n_tasks])
         multilik_batch_shape = torch.Size(batch_shape)
@@ -198,9 +202,10 @@ class VariationalMultitaskGPModel(gp.models.ApproximateGP):
         self.n_points = n_points
         self.decomp = decomp
         self.outputscales = outputscales
+        self.last_target_dim_is_datapoint = last_target_dim_is_datapoint
 
         if init_lmc_coeffs :
-            U, S, V = compute_truncated_svd(Y=train_y, n_latents=n_latents)
+            U, S, V = compute_truncated_svd(Y=train_y, n_latents=n_latents, last_target_dim_is_datapoint=last_target_dim_is_datapoint)
             S = S / np.sqrt(n_points) # because of Marchenko-Pastur Law
             lmc_coefficients = (U * S.unsqueeze(-2)).mT
             self.variational_strategy.lmc_coefficients = torch.nn.Parameter(lmc_coefficients)  #shape (n_batch x) n_latents x n_tasks
@@ -332,7 +337,10 @@ class VariationalMultitaskGPModel(gp.models.ApproximateGP):
         return dico
     
     def default_mll(self):
-        return CustomVariationalELBO(self.likelihood, self, num_data=self.n_points)
+        if self.last_target_dim_is_datapoint:
+            return TransposedVariationalELBO(self.likelihood, self, num_data=self.n_points)
+        else:
+            return gp.mlls.VariationalELBO(self.likelihood, self, num_data=self.n_points)
 
 
 

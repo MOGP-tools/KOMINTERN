@@ -380,15 +380,15 @@ def init_lmc_coefficients( train_y: Tensor, n_latents: int, QR_form:bool=False):
     return y_transformed.mT # shape (n_batch x) n_latents x n_tasks
 
 
-def compute_truncated_svd(Y: Tensor, n_latents: int):
+def compute_truncated_svd(Y: Tensor, n_latents: int, last_target_dim_is_datapoint:bool=False):
     """
-    Input shape: (n_batch x) n_tasks x n_points
+    Input shape: (n_batch x) n_tasks x n_points if last_target_dim_is_datapoint, else (n_batch x) n_points x n_tasks
     Return shapes:
     U: (n_batch x) n_tasks x n_lat
     S: (n_batch x) n_lat
     V: (n_batch x) n_points x n_lat
     """
-    Y_reshaped = Y
+    Y_reshaped = Y if last_target_dim_is_datapoint else Y.mT
     n_points = Y_reshaped.shape[-1]
     if n_points >= n_latents:
         U, S, V = torch.svd_lowrank(Y_reshaped, q=n_latents)
@@ -459,9 +459,9 @@ class PositiveDiagonalParam(torch.nn.Module):
     Torch parametrization for a positive diagonal matrix.
     """
     def forward( self, X: Tensor)-> Tensor:
-        return torch.diag_embed(torch.exp(torch.diag(X)))
+        return torch.diag_embed(torch.exp(torch.diagonal(X, dim1=-2, dim2=-1)))
     def right_inverse( self, A: Tensor)-> Tensor:
-        return torch.diag_embed(torch.log(torch.diag(A)))
+        return torch.diag_embed(torch.log(torch.diagonal(A, dim1=-2, dim2=-1)))
 
 class UpperTriangularParam(torch.nn.Module):
     """
@@ -469,11 +469,13 @@ class UpperTriangularParam(torch.nn.Module):
     """
     def forward( self, X: Tensor)-> Tensor:
         upper =  X.triu()
-        upper[range(len(upper)), range(len(upper))] = torch.exp(upper[range(len(upper)), range(len(upper))])
+        mat_side = X.shape[-1]
+        upper[..., range(mat_side), range(mat_side)] = torch.exp(upper[..., range(mat_side), range(mat_side)])
         return upper
     def right_inverse( self, A: Tensor)-> Tensor: 
         res = A
-        res[range(len(res)), range(len(res))] = torch.log(res[range(len(res)), range(len(res))])
+        mat_side = A.shape[-1]
+        res[..., range(mat_side), range(mat_side)] = torch.log(res[..., range(mat_side), range(mat_side)])
         return res
 
 class LowerTriangularParam(torch.nn.Module):
@@ -486,11 +488,13 @@ class LowerTriangularParam(torch.nn.Module):
 
     def forward( self, X: Tensor )-> Tensor:
         lower = X.tril()
-        lower[range(len(lower)), range(len(lower))] = torch.exp(torch.clamp(lower[range(len(lower)), range(len(lower))], *self.bounds))
+        mat_side = X.shape[-1]
+        lower[..., range(mat_side), range(mat_side)] = torch.exp(torch.clamp(lower[..., range(mat_side), range(mat_side)], *self.bounds))
         return lower
     def right_inverse( self, A: Tensor)-> Tensor:
         res = A
-        res[range(len(res)), range(len(res))] = torch.log(res[range(len(res)), range(len(res))])
+        mat_side = A.shape[-1]
+        res[..., range(mat_side), range(mat_side)] = torch.log(res[..., range(mat_side), range(mat_side)])
         return res
 
 ##----------------------------------------------------------------------------

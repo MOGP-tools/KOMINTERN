@@ -24,6 +24,7 @@ class MultitaskGPModel(ExactGPModel):
                   n_latents: int, 
                   likelihood:Union[Likelihood,None]=None,
                   init_lmc_coeffs:bool=True,
+                  last_target_dim_is_datapoint:bool=False,
                   model_type:str='ICM',
                   lowrank:bool=False,
                   **kwargs):
@@ -40,7 +41,10 @@ class MultitaskGPModel(ExactGPModel):
             experimental purposes. Defaults to "ICM"
             lowrank: If True, the cross-task covariance matrix is low-rank. Defaults to False
         """
-        *batch_shape, n_tasks, n_points = train_y.shape
+        if last_target_dim_is_datapoint:
+            *batch_shape, n_tasks, n_points = train_y.shape
+        else:
+            *batch_shape, n_points, n_tasks = train_y.shape
 
         super(MultitaskGPModel, self).__init__(train_x, train_y, likelihood, ignore_n_tasks=True, batch_lik=False, **kwargs)
         # we build upon a single-task GP, created by calling parent class
@@ -58,7 +62,7 @@ class MultitaskGPModel(ExactGPModel):
                                                            num_tasks=n_tasks, rank=1)
 
         if init_lmc_coeffs:
-            U, S, V = compute_truncated_svd(Y=train_y, n_latents=n_latents)
+            U, S, V = compute_truncated_svd(Y=train_y, n_latents=n_latents, last_target_dim_is_datapoint=last_target_dim_is_datapoint)
             S = S / np.sqrt(n_points) # because of Marchenko-Pastur Law
             lmc_coeffs = (U * S.unsqueeze(-2))
             if model_type=='ICM':
