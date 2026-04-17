@@ -282,7 +282,7 @@ class ProjectedGPModel(ExactGPModel):
             self.register_parameter("log_B_tilde", torch.nn.Parameter(log_init_noise * discarded_noise_tens))
             torch.nn.utils.parametrize.register_parametrization(self, "log_B_tilde", ScalarParam(bounds=(log_noise_thresh, -log_noise_thresh)))
             if BDN:
-                self.register_buffer('Y_squared_norm', (train_y**2).sum()) # case of the PLMC_fast (term for MLL computation)
+                self.register_buffer('Y_squared_norm', torch.linalg.matrix_norm(train_y)) # case of the PLMC_fast (term for MLL computation)
         elif diagonal_B:
             self.register_parameter("log_B_tilde", torch.nn.Parameter(log_init_noise * discarded_noise_tens))
             self.register_constraint("log_B_tilde", gp.constraints.GreaterThan(log_noise_thresh))
@@ -652,7 +652,7 @@ class ProjectedLMCmll(gp.mlls.ExactMarginalLogLikelihood):
                 log_B_tilde = self.model.log_B_tilde
                 B_tilde_inv_val = torch.exp(- log_B_tilde[..., 0])
                 log_B_tilde_root_diag = log_B_tilde / 2
-                self.proj_term_list[1] = ( B_tilde_inv_val * (self.model.Y_squared_norm - (target @ Q).pow(2)) ).sum().div_(num_data)
+                self.proj_term_list[1] = ( B_tilde_inv_val * (self.model.Y_squared_norm - torch.linalg.matrix_norm(target @ Q)) ).sum().div_(num_data)
                 # the parenthesis is the squared norm of the projection of target onto the space orthogonal to span(Q)
             else:
                 self.proj_term_list[1] = 0.
@@ -665,7 +665,7 @@ class ProjectedLMCmll(gp.mlls.ExactMarginalLogLikelihood):
                 B_tilde_inv_root_diag = self.model.B_tilde_inv_chol[..., range(p-q), range(p-q)]
                 log_B_tilde_root_diag = -torch.log(B_tilde_inv_root_diag)
                 rot_proj_scaled_target = target @ Q_orth @ self.model.B_tilde_inv_chol
-            self.proj_term_list[1] = (rot_proj_scaled_target**2).sum().div_(num_data)
+            self.proj_term_list[1] = torch.linalg.matrix_norm(rot_proj_scaled_target).div_(num_data)
 
         # All terms are implicitly or explicitly divided by the number of datapoints
         self.proj_term_list[0] = 2 * torch.sum(log_B_tilde_root_diag) # factor 2 because of the use of a root
