@@ -10,18 +10,18 @@ torch.backends.cuda.matmul.allow_tf32 = False
 torch.set_default_dtype(torch.float32)
 from torch.utils.data import TensorDataset, DataLoader
 import gpytorch as gp
-import wandb
+# import wandb
 
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 
-from base_gp import ExactGPModel
+from base_gp import ExactGPModel, SOGPModel
 from mogp_icm import MultitaskGPModel
 from mogp_var import VariationalMultitaskGPModel
 from mogp_plmc import ProjectedGPModel
 
-from utilities import CorrectReduceLROnPlateau
-
+from utilities import CorrectReduceLROnPlateau, CustomSpectralMixtureKernel
+from visualization import visualize_vector_function
 ##------------------------------------------------------------------
 ## Generic setup 
 
@@ -92,7 +92,7 @@ def run_models(models_to_run, n_latents, lik_rank, n_ind_points, noise_thresh, X
                mean_type=None, kernel_type=None, ker_kwargs=None, stochastic_train_variational_model=False, fix_induc_points_of_var_model=False):
     
     n_points = len(X)
-    n_tasks = Y.shape[-1]
+    n_tasks = Y.shape[-1] if len(Y.shape) > 1 else 1 
     print('Num points: {0}, num tasks: {1}'.format(n_points, n_tasks))
     if n_ind_points is not None:
         train_ind_rat = n_points / n_ind_points
@@ -112,8 +112,10 @@ def run_models(models_to_run, n_latents, lik_rank, n_ind_points, noise_thresh, X
     likelihoods, models, mlls, optimizers, schedulers = {}, {}, {}, {}, {}     
 
     if 'IGP' in models_to_run:
-        models['IGP'] = ExactGPModel(X, Y, mean_type=mean_type, kernel_type=kernel_type, ker_kwargs=ker_kwargs, batch_lik=False,
-                                        lik_mat_rank=lik_rank, noise_thresh=noise_thresh, n_ind_points=n_ind_points)
+        # models['IGP'] = ExactGPModel(X, Y, mean_type=mean_type, kernel_type=kernel_type, ker_kwargs=ker_kwargs, batch_lik=True,
+        #                                 lik_mat_rank=lik_rank, noise_thresh=noise_thresh, n_ind_points=n_ind_points)
+        models['IGP'] = SOGPModel(X, Y, mean_type=mean_type, kernel_type=kernel_type, ker_kwargs=ker_kwargs, noise_thresh=noise_thresh,
+                                  outputscales=False)
         likelihoods['IGP'] = models['IGP'].likelihood
 
     if 'ICM' in models_to_run:
@@ -164,7 +166,15 @@ def run_models(models_to_run, n_latents, lik_rank, n_ind_points, noise_thresh, X
             obj = models[name]
             for attr in attributes:
                 obj = getattr(obj, attr)
-            obj.initialize_from_data_empspect(X, Y.mT)  # Spectral Mixture Kernel has to be carefully initialized
+            # obj.initialize_from_data(X, Y)  # Spectral Mixture Kernel has to be carefully initialized
+            # obj.initialize_from_data_empspect(X, Y)  # Spectral Mixture Kernel has to be carefully initialized
+            obj.mixture_weights = 0.1 * torch.ones(ker_kwargs['num_mixtures'], device=X.device)
+            obj.mixture_means = 0.1 * torch.ones(ker_kwargs['num_mixtures'], device=X.device)
+            obj.mixture_scales = 0.1 * torch.ones(ker_kwargs['num_mixtures'], device=X.device)
+            m = models[name]
+            for el in m.named_parameters():
+                print(el)
+
         models[name].train()
         likelihoods[name].train()
         mlls[name] = models[name].default_mll()
@@ -205,7 +215,7 @@ def run_models(models_to_run, n_latents, lik_rank, n_ind_points, noise_thresh, X
                 optimizers[name].zero_grad()
                 with gp.settings.cholesky_max_tries(8):
                     output_train = models[name](X)
-                    loss = -mlls[name](output_train, Y)
+                    loss = -mlls[name](output_train, Y).squeeze()
                     loss.backward()
                     optimizers[name].step()
                     new_loss = loss.item()
@@ -237,6 +247,9 @@ def run_models(models_to_run, n_latents, lik_rank, n_ind_points, noise_thresh, X
                 break
 
         times[name] = time.time() - start
+        m = models[name]
+        for el in m.named_parameters():
+            print(el)
 
     ##------------------------------------------------------------------
     ## Making predictions
@@ -269,8 +282,10 @@ def run_models(models_to_run, n_latents, lik_rank, n_ind_points, noise_thresh, X
 
             if hasattr(full_likelihood, 'task_noise_covar'):
                 Sigma_guess = full_likelihood.task_noise_covar
-            else:
+            elif hasattr(full_likelihood, 'task_noises'):
                 Sigma_guess = torch.diag_embed(full_likelihood.task_noises)
+            else:
+                Sigma_guess = torch.eye(n_tasks) * full_likelihood.noise
             ##------------------------------------------------------------------
             ## Computing, displaying and storing performance metrics
             metrics = compute_metrics(y_test=Y_test, y_pred=pred_y, std_pred=std_pred, loss=last_losses[name], Sigma_guess=Sigma_guess,
@@ -296,7 +311,7 @@ if experiment=='tidal':
     ## Data preprocessing
     root = '_experiments/bramblemet/'
     degree = 2 # degree of the polynomial detrending
-    ndiv = 4 # subsampling factor
+    ndiv = 1 # subsampling factor
     start_date = '2020-06-01'
     end_date = '2020-06-16'
     dico = {}
@@ -327,41 +342,48 @@ if experiment=='tidal':
     num_days = (end_date - start_date).days
     test_indices = np.arange(len(df)//num_days) # test set is one day in the middle of the time series
 
-    Y = Y[:, :1]
-
+    X = X * 1e5
     X, X_test = np.delete(X, test_indices, axis=0), X[test_indices]
     Y, Y_test = np.delete(Y, test_indices, axis=0), Y[test_indices]
     Mean, Std = Y.mean(axis=0), Y.std(axis=0)
     Y, Y_test = (Y - Mean) / Std, (Y_test - Mean) / Std
-    n_points, n_tasks = Y.shape
     X, Y, X_test, Y_test = torch.as_tensor(X), torch.as_tensor(Y), torch.as_tensor(X_test), torch.as_tensor(Y_test)
+    n_points, n_tasks = Y.shape
+    Y = Y[:, :1]
+    # visualize_vector_function(X, Y)
+    # bonjour
+
+    Y = Y[:, 0]
+    Y_test = Y_test[:, 0]
+    n_tasks = 1
 
     ## Model parameters
     kernel_type = gp.kernels.SpectralMixtureKernel
+    # kernel_type = CustomSpectralMixtureKernel
     v = {
         'q': 2, 
         'lik_rank': 0,
-        'n_mix':2,
+        'n_mix':1,
+        'lr_max': 1e-1,
         'void' : [0.]}
     v_vals = {
         'q' : range(1, n_tasks+1), 
         'lik_rank' : [0, n_tasks],
         'n_mix': range(2,10),
+        'lr_max': np.logspace(-4, 0, 4),
         'void' : [0.]}
-    v_test_0 = 'n_mix'
+    v_test_0 = 'void'
     v_test_1 = 'void'
     noise_thresh = 1e-3
     n_ind_points = None
 
     ## Specific training settings
     spec_lr_min = 1e-4
-    spec_lr_max = 1e-2
     spec_n_iters = 50000
     spec_use_stop = True
     spec_loss_thresh = 1e-3
     spec_patience_sched = 1000
     spec_patience_crit = spec_patience_sched * 5
-    training_settings = (spec_lr_min, spec_lr_max, spec_n_iters, spec_use_stop, spec_loss_thresh, spec_patience_crit, spec_patience_sched)
 
     appendix += 'div{0}_{1}days'.format(ndiv, num_days)
     if n_ind_points is not None:
@@ -379,6 +401,8 @@ if experiment=='tidal':
                 v[v_test_1] = vval1
                 v[v_test_2] = vval2
                 q, lik_rank = v['q'], v['lik_rank']
+                spec_lr_max = v['lr_max']
+                training_settings = (spec_lr_min, spec_lr_max, spec_n_iters, spec_use_stop, spec_loss_thresh, spec_patience_crit, spec_patience_sched)
                 run_key = v_test_0 + '_' + v_test_1 + '_' + v_test_2 + '_{0}_{1}_{2}'.format(i_v, i_v1, i_v2)
                 results, models = run_models(models_to_run=models_to_run,
                                                 n_latents=q,
@@ -452,19 +476,19 @@ if experiment=='ship':
     ## Data preprocessing
     root = '_experiments/ship/'
     ndiv = 5 # subsampling factor
-    data = pd.read_csv(root + "data.txt", sep=r"\s+", engine="python", dtype=str, header=None).astype(np.float32)
-    data = data.iloc[::ndiv]
+    data = pd.read_csv(root + "data.txt", sep=r"\s+", engine="python", dtype=str, header=None).astype(np.float64)
+    i_points = np.random.choice(len(data), replace=False, size=600)
+    data = data.iloc[i_points]
     X = data.iloc[:, [0, 16, 17]].values
     Y = data.drop([0, 1, 8, 11, 16, 17], axis=1).values
-
-    ## Data formatting for model use
-    X, X_test = X[:-100], X[-100:]
-    Y, Y_test = Y[:-100], Y[-100:]
+    X_test, X = X[:100], X[100:]
+    Y_test, Y = Y[:100], Y[100:]
+    visualize_vector_function(X, Y)
+    bonjour
     Mean, Std = Y.mean(axis=0), Y.std(axis=0)
     Y, Y_test = (Y - Mean) / Std, (Y_test - Mean) / Std
     n_points, n_tasks = Y.shape
     X, Y, X_test, Y_test = torch.as_tensor(X), torch.as_tensor(Y), torch.as_tensor(X_test), torch.as_tensor(Y_test)
-    Y = Y.mT
 
     ## Model parameters
     v = {

@@ -27,14 +27,14 @@ from utilities import CorrectReduceLROnPlateau
 
 v = {  # default parameter values
 'n' : 500, #500,
-'p' : 3, #100,
-'q' : 2, #10,
+'p' : 100, #100,
+'q' : 10, #10,
 'q_guess' : 10,  # q_guess is here to investigate model misspecification (q is the number of latent processes of the data)
-'q_noise' : 3, #10,
+'q_noise' : 10, #10,
 'q_noise_guess' : 10,  # q_noise_guess is here to investigate model misspecification (q_noise is the number of latent processes of the data)
 'mu_noise' : 1e-1, #1e-1,
-'mu_str' : 0., #0.5,
-'min_scale' : 0.1, #0.1,
+'mu_str' : 0.5, #0.5,
+'min_scale' : 0.01, #0.1,
 'void' : 0.
 }
 
@@ -42,19 +42,19 @@ v_vals = {  # values to be tested
 'n' : range(100, 501, 50),
 'p' : range(25, 201, 25),
 'q' : range(10, 91, 10),
-'q_guess' : range(10, 91, 10),
+'q_guess' : range(1, 32, 10),
 'q_noise' : range(10, 91, 10),
-'q_noise_guess' : range(10, 91, 10),
+'q_noise_guess' : range(0, 91, 10),
 'mu_noise' : np.logspace(-3, np.log10(0.5), 10),
-'mu_str' : np.linspace(1e-3, 1., 10),
+'mu_str' : np.linspace(0., 1., 10),
 'min_scale' : np.linspace(0.1, 1., 10),
 'void' : [0.]
 }
 max_scale = 1.,
 n_test = 2500 # number of test points
 
-models_to_run = ['ICM','PLMC','oilmm','var','PLMC_fast', 'PLMC_orthpar']
-models_to_run = ['ICM']
+models_to_run = ['ICM','PLMC','oilmm','var','PLMC_fast']
+models_to_run = ['PLMC_fast']
 v_test = 'void' # replace by the parameter to be tested (or perform a one-point experiment)
 v_test_2 = 'void' # if not 'void', interaction between two parameters is tested
 n_random_runs = 1 # number of random repetitions of the experiment (each one with different data)
@@ -64,9 +64,12 @@ n_random_runs = 1 # number of random repetitions of the experiment (each one wit
 
 # v_test, n_random_runs = 'mu_noise', 50
 # v_test, n_random_runs = 'mu_str', 50
-# v_test, n_random_runs = 'q_noise', 50
 # v_test, n_random_runs = 'p', 50
 # v_test, n_random_runs = 'q', 50
+# v_test, n_random_runs = 'q_noise', 50
+# v_test, n_random_runs = 'min_scale', 50
+# v_test, n_random_runs = 'q_noise_guess', 50
+# v_test, n_random_runs = 'n', 50
 ##----------------------------------------------------------------------------------------------------------------------
 
 ## Results formatting
@@ -75,14 +78,13 @@ print_metrics=True  # if True, performance metrics are printed at each run (dose
 print_loss=True # if True, loss is printed after freq_print iteration (dosen't affect exported results)
 freq_print=1000
 appendix = '' # to further customize experiment name
-landmarks = [1] + list(range(10, n_random_runs + 1, 10))
 path = 'results/parameter_study_' + v_test + '_' + v_test_2 + appendix + '.csv'
 export_results = True
 
 ##----------------------------------------------------------------------------------------------------------------------
 ## Training settings
 lr_min = 1e-4
-lr_max = 1e-2
+lr_max = 1e-1
 n_iters = 100000
 use_stop = True
 loss_thresh = 1e-3 # threshold for loss plateau detection
@@ -148,7 +150,6 @@ for i_run in range(n_random_runs):
 
             ## Generating artificial data
             lscales = torch.as_tensor(np.linspace(min_scale, max_scale, q))
-            lscales_hid = torch.as_tensor(np.linspace(min_scale, max_scale, q_noise))
             ker_list = [gp.kernels.MaternKernel() for i in range(q)]
             for i in range(q):
                 ker_list[i].lengthscale = lscales[i]
@@ -162,7 +163,6 @@ for i_run in range(n_random_runs):
             lat_gp_dist = [gp.distributions.MultivariateNormal(torch.zeros_like(X), kernel(X)) for kernel in ker_list]
             gp_vals = torch.stack([dist.sample() for dist in lat_gp_dist])
             Y_sig = gp_vals.T @ H_true * (1 - mu_noise)
-            H_true = H_true.numpy()
 
             ## structured noise
             H_noise_true = torch.randn(size=(q_noise, p))
@@ -193,7 +193,7 @@ for i_run in range(n_random_runs):
                 q_noise_guess, v['q_noise_guess'] = p, p
             if v_test!= 'q_guess':  # if q_guess is not the parameter to be tested, we use a full rank noise (general Sigma matrix)
                 q_guess, v['q_guess'] = q, q
-            q_noise_guess = 0
+            # q_noise_guess = 0
 
             likelihoods, models, mlls, optimizers, schedulers = {}, {}, {}, {}, {}
             
@@ -210,7 +210,7 @@ for i_run in range(n_random_runs):
                 likelihoods['var'] = models['var'].likelihood
                 
             if 'PLMC' in models_to_run:
-                models['PLMC'] = ProjectedGPModel(X, Y, n_latents=q_guess, mean_type=mean_type,  kernel_type=kernel_type, 
+                models['PLMC'] = ProjectedGPModel(X, Y, n_latents=q_guess, mean_type=mean_type,  kernel_type=kernel_type, diagonal_B=False,
                                                 n_ind_points=n_ind_points, noise_thresh=noise_thresh, BDN=False, diagonal_R=False, scalar_B=False)
                 likelihoods['PLMC'] = models['PLMC'].likelihood
 
@@ -222,7 +222,6 @@ for i_run in range(n_random_runs):
             if 'PLMC_fast' in models_to_run:
                 models['PLMC_fast'] = ProjectedGPModel(X, Y, n_latents=q_guess, mean_type=mean_type, kernel_type=kernel_type, 
                                                 n_ind_points=n_ind_points, noise_thresh=noise_thresh, BDN=True, diagonal_R=False, scalar_B=True)
-                
                 likelihoods['PLMC_fast'] = models['PLMC_fast'].likelihood
 
             if 'oilmm' in models_to_run:
@@ -265,10 +264,8 @@ for i_run in range(n_random_runs):
                     if name == "var" and stochastic_train_variational_model:
                         new_loss = 0.
                         for X_batch, Y_batch in train_loader:
-                            Y_batch = Y_batch.mT
                             optimizers[name].zero_grad()
-                            with gp.settings.cholesky_max_tries(8),\
-                                gp.settings.max_cholesky_size(1e6):
+                            with gp.settings.cholesky_max_tries(8):
                                 output_train = models[name](X_batch)
                                 loss = -mlls[name](output_train, Y_batch)
                                 loss.backward()
@@ -311,13 +308,6 @@ for i_run in range(n_random_runs):
                         break
 
                 times[name] = time.time() - start
-                for el in models[name].named_parameters():
-                    print(el)
-                m = models[name]
-                # print('lengthscale', m.covar_module.data_covar_module.lengthscale)
-                # print('lengthscale', m.covar_module.lengthscale)
-                # print(H_true.T @ H_true)
-                # print(m.covar_module.task_covar_module.covar_matrix.to_dense())
             ##------------------------------------------------------------------
                 
             ## Making predictions
@@ -328,7 +318,6 @@ for i_run in range(n_random_runs):
                     X_test, Y_test = X_test.cuda(), Y_test.cuda()
 
             for name in models_to_run:
-            # All these algebra options have been tested to have little impact on results.
             # The skip_posterior_variances option is here to be able to compute posterior mean for model ICM, even when
             # covariance computation would saturate memory. It should be deactivated when possible.
                 skip_var = (name=='ICM')
@@ -358,31 +347,6 @@ for i_run in range(n_random_runs):
                     else:
                         Sigma_guess = torch.diag_embed(full_likelihood.task_noises)
 
-                    # X_test = X_test.squeeze().cpu().numpy()
-                    # permut = np.argsort(X_test)
-                    # pred_y_num = pred_y.cpu().numpy()
-                    # Y_test_num = Y_test.cpu().numpy()
-                    # X_test, pred_y_num, Y_test_num = X_test[permut], pred_y_num[permut], Y_test_num[permut]
-                    # plt.figure()                    
-                    # plt.plot(X_test, pred_y_num[:, 0], label='pred')
-                    # plt.plot(X_test, Y_test_num[:, 0], label='true')
-                    # plt.legend()
-                    # plt.savefig('preds_0')
-                    # plt.close()
-
-                    # plt.figure()                    
-                    # plt.plot(X_test, pred_y_num[:, 1], label='pred')
-                    # plt.plot(X_test, Y_test_num[:, 1], label='true')
-                    # plt.legend()
-                    # plt.savefig('preds_1')
-                    # plt.close()
-
-                    # plt.figure()                    
-                    # plt.plot(X_test, pred_y_num[:, 2], label='pred')
-                    # plt.plot(X_test, Y_test_num[:, 2], label='true')
-                    # plt.legend()
-                    # plt.savefig('preds_2')
-                    # plt.close()
                     ##------------------------------------------------------------------
                     ## Computing, displaying and storing performance metrics
                     metrics = compute_metrics(y_test=Y_test, y_pred=pred_y, std_pred=std_pred, loss=last_losses[name],
