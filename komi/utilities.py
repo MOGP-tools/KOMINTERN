@@ -6,8 +6,8 @@ import torch
 from torch import Tensor
 import gpytorch as gp
 from gpytorch.kernels.kernel import Kernel
-from gpytorch.kernels.rq_kernel import RQKernel
-from sklearn.utils.extmath import randomized_svd
+from sklearn.cluster import KMeans
+from scipy.stats import qmc
 
 ##----------------------------------------------------------------------------------------------------------------------
 ## Basics
@@ -351,35 +351,6 @@ def handle_covar_( kernel: Kernel, dim: int, decomp: Union[List[List[int]], None
 
     return covar_module
 
-def init_lmc_coefficients( train_y: Tensor, n_latents: int, QR_form:bool=False):
-    # n_data, n_tasks, n_batch = train_y.shape
-    n_batch, n_data, n_tasks = train_y.shape
-    Us, Ss = [], []
-    dtype, device = train_y.dtype, train_y.device
-    train_y = train_y.cpu().numpy()
-    for i in range(n_batch):
-        if n_data >= n_latents:
-            U, S, Vt = randomized_svd(train_y[i, ...].T, n_components=n_latents, random_state=0)
-        else:
-            Q, R = np.linalg.qr(train_y[i, ...].T, mode='complete') # use np QR instead of torch's to have positive diagonal of R
-            S = 1e-3 * np.ones(n_latents)
-            S[:n_data] = np.diag(R).copy()
-            U = Q[:,:n_latents]
-        Us.append(U)
-        Ss.append(S[None, :])
-
-    S_tens = np.stack(Ss, axis=0)
-    U_tens = np.stack(Us, axis=0)
-    S_tens = S_tens / np.sqrt(n_data - 1)
-    U_tens = torch.as_tensor(U_tens, device=device, dtype=dtype)
-    S_tens = torch.as_tensor(S, device=device, dtype=dtype)
-    if QR_form:
-        return U_tens, S_tens
-    else:
-        y_transformed = U_tens * S_tens
-    return y_transformed.mT # shape (n_batch x) n_latents x n_tasks
-
-
 def compute_truncated_svd(Y: Tensor, n_latents: int, last_target_dim_is_datapoint:bool=False):
     """
     Input shape: (n_batch x) n_tasks x n_points if last_target_dim_is_datapoint, else (n_batch x) n_points x n_tasks
@@ -401,6 +372,42 @@ def compute_truncated_svd(Y: Tensor, n_latents: int, last_target_dim_is_datapoin
         V = torch.ones_like(R.mT)
         V = V[..., :n_latents]
     return U, S, V
+
+
+def initialize_inducing_points(X:Tensor, M:int, with_qmc:bool, seed:int=0):
+    """
+    Initializes M inducing point locations using K-means clustering.
+    
+    Parameters:
+    X (ndarray or tensor): Training inputs of shape (n_points, n_dims)
+    M (int): Number of inducing points (clusters)
+    
+    Returns:
+    Z (ndarray): Initialized inducing point locations of shape (M, n_dims)
+    """
+    if hasattr(X, "detach"):
+        X_np = X.detach().cpu().numpy()
+    elif hasattr(X, "numpy"):
+        X_np = X.numpy()
+    else:
+        X_np = np.asarray(X)
+
+    if with_qmc:
+        dim = X.shape[-1]
+        sampler = qmc.LatinHypercube(d=dim, seed=seed)
+        locations = 2 * sampler.random(n=M) - 1
+    else:
+        # n_init='auto' is recommended for newer sklearn versions
+        # Use k-means++ for better initial centroid placement
+        kmeans = KMeans(n_clusters=M, n_init='auto', init='k-means++')
+        kmeans.fit(X_np)
+        locations = kmeans.cluster_centers_
+
+    if hasattr(X, "numpy"):
+        res = torch.as_tensor(locations, dtype=X.dtype, device=X.device)
+    else:
+        res = locations
+    return res
 
 def get_median_heuristic_ard(X, num_samples=1000):
     """

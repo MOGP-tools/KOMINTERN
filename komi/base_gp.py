@@ -11,7 +11,7 @@ from gpytorch.mlls.marginal_log_likelihood import MarginalLogLikelihood
 from gpytorch.models.exact_prediction_strategies import prediction_strategy
 from torch import Tensor
 
-from utilities import handle_covar_ , get_median_heuristic_ard, CustomMultitaskGaussianLikelihood
+from utilities import handle_covar_ , get_median_heuristic_ard, CustomMultitaskGaussianLikelihood, initialize_inducing_points
 
 class ExactGPModel(gp.models.ExactGP):
     """
@@ -34,8 +34,10 @@ class ExactGPModel(gp.models.ExactGP):
                   ignore_n_tasks:bool=False,
                   prior_scales:Union[Tensor, None]=None,
                   prior_width:Union[Tensor, None]=None,
+                  init_induc_with_qmc:bool=False,
                   ker_kwargs:Union[dict,None]=None,
                   jitter_val:float=1e-6,
+                  seed:int=0,
                   **kwargs ):
         """
         Args:
@@ -75,7 +77,7 @@ class ExactGPModel(gp.models.ExactGP):
         if batch_lik is None:
             batch_lik = ( len(batch_shape) < 2 or batch_shape == (1,1) )
         if likelihood is None:
-            noise_init = 1.
+            noise_init = 1e-1
             if batch_lik :
                 likelihood = gp.likelihoods.GaussianLikelihood(batch_shape=lik_batch_shape, noise_constraint=gp.constraints.GreaterThan(noise_thresh))
                 likelihood.noise = noise_init * torch.ones_like(likelihood.noise)
@@ -105,6 +107,7 @@ class ExactGPModel(gp.models.ExactGP):
                                           batch_shape=output_batch_shape, ker_kwargs=ker_kwargs)
         if n_inducing_points is not None:
             self.covar_module = gp.kernels.InducingPointKernel(self.covar_module, torch.randn(n_inducing_points, self.dim), likelihood)
+            self.covar_module.inducing_points = initialize_inducing_points(X=train_x, M=n_inducing_points, with_qmc=init_induc_with_qmc, seed=seed)
         
         if jitter_val is None:
             self.jitter_val = gp.settings.cholesky_jitter.value(train_x.dtype)

@@ -8,45 +8,9 @@ import gpytorch as gp
 from gpytorch.means.mean import Mean
 from gpytorch.kernels.kernel import Kernel
 from gpytorch.likelihoods.likelihood import Likelihood
-from sklearn.cluster import KMeans
-from scipy.stats import qmc
 
-from utilities import handle_covar_, compute_truncated_svd, get_median_heuristic_ard, CustomMultitaskGaussianLikelihood
+from utilities import handle_covar_, compute_truncated_svd, get_median_heuristic_ard, CustomMultitaskGaussianLikelihood, initialize_inducing_points
 
-def initialize_inducing_points(X:Tensor, M:int, with_qmc:bool, seed:int=0):
-    """
-    Initializes M inducing point locations using K-means clustering.
-    
-    Parameters:
-    X (ndarray or tensor): Training inputs of shape (n_points, n_dims)
-    M (int): Number of inducing points (clusters)
-    
-    Returns:
-    Z (ndarray): Initialized inducing point locations of shape (M, n_dims)
-    """
-    if hasattr(X, "detach"):
-        X_np = X.detach().cpu().numpy()
-    elif hasattr(X, "numpy"):
-        X_np = X.numpy()
-    else:
-        X_np = np.asarray(X)
-
-    if with_qmc:
-        dim = X.shape[-1]
-        sampler = qmc.LatinHypercube(d=dim, seed=seed)
-        locations = 2 * sampler.random(n=M) - 1
-    else:
-        # n_init='auto' is recommended for newer sklearn versions
-        # Use k-means++ for better initial centroid placement
-        kmeans = KMeans(n_clusters=M, n_init='auto', init='k-means++')
-        kmeans.fit(X_np)
-        locations = kmeans.cluster_centers_
-
-    if hasattr(X, "numpy"):
-        res = torch.as_tensor(locations, dtype=X.dtype, device=X.device)
-    else:
-        res = locations
-    return res
 
 class TransposedVariationalELBO(gp.mlls.VariationalELBO):
     def forward(self, variational_dist_f, target, **kwargs):
