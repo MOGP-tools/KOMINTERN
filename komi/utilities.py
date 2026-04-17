@@ -6,6 +6,7 @@ import torch
 from torch import Tensor
 import gpytorch as gp
 from gpytorch.kernels.kernel import Kernel
+from gpytorch.priors import Prior
 from sklearn.cluster import KMeans
 from scipy.stats import qmc
 
@@ -126,12 +127,6 @@ class SplineKernel(gp.kernels.Kernel):
             res = res.unsqueeze(batch_dim).expand(*self.batch_shape, *res.shape)
         return res
 
-# class FixedRQKernel(RQKernel):
-#     def __init__(self, *args, **kwargs):
-#         super().__init__(*args, **kwargs)
-#         self.raw_alpha.requires_grad = False
-#         self.alpha = 8
-
 class FixedRQKernel(gp.kernels.Kernel):
     has_lengthscale = True
 
@@ -144,6 +139,24 @@ class FixedRQKernel(gp.kernels.Kernel):
         for i in range(3):
             res = res*res
         return 1/res
+
+class CustomSpectralMixtureKernel(gp.kernels.SpectralMixtureKernel):
+    def __init__(self, num_mixtures: int | None = None,
+                 ard_num_dims: int | None = 1,
+                 batch_shape: torch.Size | None = torch.Size([]),
+                 mixture_scales_prior: Prior | None = None,
+                 mixture_scales_constraint: Interval | None = None,
+                 mixture_means_prior: Prior | None = None,
+                 mixture_means_constraint: Interval | None = None,
+                 mixture_weights_prior: Prior | None = None,
+                 mixture_weights_constraint: Interval | None = None,
+                 **kwargs):
+        super().__init__(num_mixtures, ard_num_dims, batch_shape, mixture_scales_prior,
+                         mixture_scales_constraint, mixture_means_prior, mixture_means_constraint,
+                         mixture_weights_prior, mixture_weights_constraint, **kwargs)
+        self.register_constraint("raw_mixture_scales", gp.constraints.GreaterThan(-4))
+        self.register_constraint("raw_mixture_means", gp.constraints.GreaterThan(-4))
+        self.register_constraint("raw_mixture_weights", gp.constraints.GreaterThan(-4))
 
 class PolynomialMean(gp.means.mean.Mean):
     def __init__( self, input_size, batch_shape=torch.Size(), bias=True, degree=3):
