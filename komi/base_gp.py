@@ -278,3 +278,43 @@ class ExactGPModel(gp.models.ExactGP):
             A MarginalLogLikelihood object for the model
         """
         return gp.mlls.ExactMarginalLogLikelihood(self.likelihood, self)
+
+
+class SOGPModel(gp.models.ExactGP):
+    def __init__( self,
+                  train_x:Tensor,
+                  train_y:Tensor,
+                  likelihood:Union[Likelihood,None]=None,
+                  kernel_type:Kernel=gp.kernels.RBFKernel,
+                  mean_type:Mean=gp.means.ConstantMean,
+                  noise_thresh:float=1e-4,
+                  ker_kwargs:Union[dict,None]=None,
+                  outputscales:bool=True,
+                  **kwargs ):
+        noise_init = 0.1
+        if likelihood is None:
+            likelihood = gp.likelihoods.GaussianLikelihood(noise_constraint=gp.constraints.GreaterThan(noise_thresh))
+            likelihood.noise = noise_init * torch.ones_like(likelihood.noise)
+        super(SOGPModel, self).__init__(train_x, train_y, likelihood)
+        self.mean_module = mean_type()
+        ker_kwargs = {} if ker_kwargs is None else ker_kwargs
+        covar_module = kernel_type(**ker_kwargs)
+        if outputscales:
+            self.covar_module = gp.kernels.ScaleKernel(covar_module)
+        else:
+            self.covar_module = covar_module
+        self.likelihood = likelihood
+
+
+    def forward(self, x):
+        mean_x = self.mean_module(x)
+        covar_x = self.covar_module(x)
+        return gp.distributions.MultivariateNormal(mean_x, covar_x)
+
+    def default_mll(self) -> MarginalLogLikelihood:
+        """
+        Returns the default marginal log likelihood (loss function) object for the model.
+        Returns:
+            A MarginalLogLikelihood object for the model
+        """
+        return gp.mlls.ExactMarginalLogLikelihood(self.likelihood, self)
