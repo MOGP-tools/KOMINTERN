@@ -254,7 +254,7 @@ class VariationalMultitaskGPModel(gp.models.ApproximateGP):
         """
         with torch.no_grad():
             # Nice point : self.variational_strategy.base_variational_strategy.prior_distribution.lazy_covariance_matrix is cached by gpytorch
-            K_plus = self.variational_strategy.base_variational_strategy.prior_distribution.lazy_covariance_matrix.evaluate()
+            K_plus = self.variational_strategy.base_variational_strategy.pseudo_points[0]
         return torch.linalg.cond(K_plus)
 
     
