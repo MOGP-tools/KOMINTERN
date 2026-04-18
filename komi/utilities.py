@@ -671,18 +671,53 @@ class CorrectReduceLROnPlateau(torch.optim.lr_scheduler.ReduceLROnPlateau):
     torch's ReduceLROnPlateau has incorrect behavior in relative mode when the loss is negative : the sign in 1.0 +/- self.threshold is wrong
     (see https://github.com/pytorch/pytorch/issues/47513)
     """
-    def _is_better(self, a, best):  # noqa: D102
+    def _is_better(self, a, best, return_thresh=False):  # noqa: D102
         if self.mode == "min" and self.threshold_mode == "rel":
             rel_epsilon = 1.0 - self.threshold if best > 0. else 1.0 + self.threshold
-            return a < best * rel_epsilon
+            thresh = best * rel_epsilon
+            res = a < thresh
 
         elif self.mode == "min" and self.threshold_mode == "abs":
-            return a < best - self.threshold
+            thresh = best - self.threshold
+            res = a < thresh
 
         elif self.mode == "max" and self.threshold_mode == "rel":
             rel_epsilon = self.threshold + 1.0 if best > 0. else 1.0 - self.threshold
-            return a > best * rel_epsilon
+            thresh = best * rel_epsilon
+            res = a > thresh
 
         else:  # mode == 'max' and epsilon_mode == 'abs':
-            return a > best + self.threshold
+            thresh = best + self.threshold
+            res = a > thresh
+
+        return thresh if return_thresh else res
+
+    def step(self, metrics, epoch=None) -> None:  # type: ignore[override]
+        """Perform a step."""
+        # convert `metrics` to float, in case it's a zero-dim Tensor
+        current = float(metrics)
+        if epoch is None:
+            epoch = self.last_epoch + 1
+        else:
+            warnings.warn(EPOCH_DEPRECATION_WARNING, UserWarning)
+        self.last_epoch = epoch
+
+        if self._is_better(current, self.best):
+            # print('Loss has improved enough ! Current: {0}, thresh: {2}, best: {1}', current, self.best, self._is_better(current, self.best, return_thresh=True))
+            self.best = current
+            self.num_bad_epochs = 0
+        else:
+            self.num_bad_epochs += 1
+
+        if self.in_cooldown:
+            self.cooldown_counter -= 1
+            self.num_bad_epochs = 0  # ignore any bad epochs in cooldown
+
+        if self.num_bad_epochs > self.patience:
+            self._reduce_lr(epoch)
+            self.cooldown_counter = self.cooldown
+            self.num_bad_epochs = 0
+
+        self._last_lr = [group["lr"] for group in self.optimizer.param_groups]
+
 
