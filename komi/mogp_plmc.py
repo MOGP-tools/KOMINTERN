@@ -279,8 +279,8 @@ class ProjectedGPModel(ExactGPModel):
         log_init_noise = np.log(noise_init)
         if scalar_B:
             diagonal_B = True
-            self.register_parameter("log_B_tilde", torch.nn.Parameter(log_init_noise * discarded_noise_tens))
-            torch.nn.utils.parametrize.register_parametrization(self, "log_B_tilde", ScalarParam(bounds=(log_noise_thresh, -log_noise_thresh)))
+            self.register_parameter("log_B_tilde", torch.nn.Parameter(log_init_noise * discarded_noise_tens[..., :1]))
+            self.register_constraint("log_B_tilde", gp.constraints.GreaterThan(log_noise_thresh))
             if BDN:
                 self.register_buffer('Y_squared_norm', torch.linalg.matrix_norm(train_y) ** 2) # case of the PLMC_fast (term for MLL computation)
         elif diagonal_B:
@@ -366,7 +366,7 @@ class ProjectedGPModel(ExactGPModel):
         
         if self.n_latents < self.n_tasks:
             if self.scalar_B:
-                B_tilde = B_tilde_root[..., :1] ** 2 # Only taske the scalar value, not the full vector (but same number of dimensions) 
+                B_tilde = B_tilde_root ** 2 # Only taske the scalar value, not the full vector (but same number of dimensions) 
                 if diag:
                     B_term = B_tilde * (1 - (Q**2).sum(dim=-1))
                 else:
@@ -651,8 +651,8 @@ class ProjectedLMCmll(gp.mlls.ExactMarginalLogLikelihood):
         if not self.model._has_M_term and self.model.scalar_B: # case of the PLMC-fast
             if self.model.log_B_tilde.numel() > 0:
                 log_B_tilde = self.model.log_B_tilde
-                scalar_B_tilde_inv = torch.exp(- log_B_tilde[..., 0])
-                log_B_tilde_root_diag = log_B_tilde / 2
+                scalar_B_tilde_inv = torch.exp(- log_B_tilde)
+                log_B_tilde_root_diag = log_B_tilde / 2 * (p - q)
                 self.proj_term_list[1] = ( scalar_B_tilde_inv * (self.model.Y_squared_norm - torch.linalg.matrix_norm(target @ Q) ** 2) ).sum()/ num_data
                 # the parenthesis is the squared norm of the projection of target onto the space orthogonal to span(Q)
             else:
@@ -670,6 +670,7 @@ class ProjectedLMCmll(gp.mlls.ExactMarginalLogLikelihood):
 
         # All terms are implicitly or explicitly divided by the number of datapoints
         self.proj_term_list[0] = 2 * torch.sum(log_B_tilde_root_diag) # factor 2 because of the use of a root
+
         if self.model.lmc_coefficients.bulk:
             self.proj_term_list[2] = torch.log(R[..., range(q), range(q)]**2).sum() # keep the square in the log because the quantity can be negative
         else:
