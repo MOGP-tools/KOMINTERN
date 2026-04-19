@@ -282,7 +282,7 @@ class ProjectedGPModel(ExactGPModel):
             self.register_parameter("log_B_tilde", torch.nn.Parameter(log_init_noise * discarded_noise_tens))
             torch.nn.utils.parametrize.register_parametrization(self, "log_B_tilde", ScalarParam(bounds=(log_noise_thresh, -log_noise_thresh)))
             if BDN:
-                self.register_buffer('Y_squared_norm', torch.linalg.matrix_norm(train_y)) # case of the PLMC_fast (term for MLL computation)
+                self.register_buffer('Y_squared_norm', torch.linalg.matrix_norm(train_y) ** 2) # case of the PLMC_fast (term for MLL computation)
         elif diagonal_B:
             self.register_parameter("log_B_tilde", torch.nn.Parameter(log_init_noise * discarded_noise_tens))
             self.register_constraint("log_B_tilde", gp.constraints.GreaterThan(log_noise_thresh))
@@ -640,19 +640,20 @@ class ProjectedLMCmll(gp.mlls.ExactMarginalLogLikelihood):
         # Get the log prob of the marginal distribution of latent processes
         latent_output = self.likelihood(latent_function_dist, *params) # shape (n_batch x) n_latents x n_points
         latent_res = latent_output.log_prob(proj_target)
-        latent_res = self._add_other_terms(latent_res, params).sum()/ num_data  # Scale by the amount of data we have
+        latent_res = self._add_other_terms(latent_res, params).sum() / num_data  # Scale by the amount of data we have
 
         # compute the part of likelihood lost by projection
         p, q = self.model.n_tasks, self.model.n_latents
         self.proj_term_list = [0]*3
         ## We store the additional terms in a list attribute in order to be able to plot them individually for testing
         Q, R, Q_orth = self.model.lmc_coefficients.QR()
+        
         if not self.model._has_M_term and self.model.scalar_B: # case of the PLMC-fast
             if self.model.log_B_tilde.numel() > 0:
                 log_B_tilde = self.model.log_B_tilde
-                B_tilde_inv_val = torch.exp(- log_B_tilde[..., 0])
+                scalar_B_tilde_inv = torch.exp(- log_B_tilde[..., 0])
                 log_B_tilde_root_diag = log_B_tilde / 2
-                self.proj_term_list[1] = ( B_tilde_inv_val * (self.model.Y_squared_norm - torch.linalg.matrix_norm(target @ Q)) ).sum()/ num_data
+                self.proj_term_list[1] = ( scalar_B_tilde_inv * (self.model.Y_squared_norm - torch.linalg.matrix_norm(target @ Q) ** 2) ).sum()/ num_data
                 # the parenthesis is the squared norm of the projection of target onto the space orthogonal to span(Q)
             else:
                 self.proj_term_list[1] = 0.
@@ -665,7 +666,7 @@ class ProjectedLMCmll(gp.mlls.ExactMarginalLogLikelihood):
                 B_tilde_inv_root_diag = self.model.B_tilde_inv_chol[..., range(p-q), range(p-q)]
                 log_B_tilde_root_diag = -torch.log(B_tilde_inv_root_diag)
                 rot_proj_scaled_target = target @ Q_orth @ self.model.B_tilde_inv_chol
-            self.proj_term_list[1] = torch.linalg.matrix_norm(rot_proj_scaled_target)/ num_data
+            self.proj_term_list[1] = torch.linalg.matrix_norm(rot_proj_scaled_target) ** 2 / num_data
 
         # All terms are implicitly or explicitly divided by the number of datapoints
         self.proj_term_list[0] = 2 * torch.sum(log_B_tilde_root_diag) # factor 2 because of the use of a root
