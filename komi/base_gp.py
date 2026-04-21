@@ -107,7 +107,8 @@ class ExactGPModel(gp.models.ExactGP):
                                           batch_shape=output_batch_shape, ker_kwargs=ker_kwargs)
         if n_inducing_points is not None:
             self.covar_module = gp.kernels.InducingPointKernel(self.covar_module, torch.randn(n_inducing_points, self.dim), likelihood)
-            self.covar_module.inducing_points = initialize_inducing_points(X=train_x, M=n_inducing_points, with_qmc=init_induc_with_qmc, seed=seed)
+            induc_locations = initialize_inducing_points(X=train_x, M=n_inducing_points, with_qmc=init_induc_with_qmc, seed=seed)
+            self.covar_module.inducing_points = torch.nn.Parameter(induc_locations)
         
         if jitter_val is None:
             self.jitter_val = gp.settings.cholesky_jitter.value(train_x.dtype)
@@ -290,10 +291,11 @@ class SOGPModel(gp.models.ExactGP):
                   noise_thresh:float=1e-4,
                   ker_kwargs:Union[dict,None]=None,
                   outputscales:bool=True,
+                  n_inducing_points:int|None = None,
                   **kwargs ):
         noise_init = 0.1
         if likelihood is None:
-            likelihood = gp.likelihoods.GaussianLikelihood(noise_constraint=gp.constraints.GreaterThan(noise_thresh))
+            likelihood = gp.likelihoods.GaussianLikelihood(noise_constraint=gp.constraints.Interval(noise_thresh, 0.2))
             likelihood.noise = noise_init * torch.ones_like(likelihood.noise)
         super(SOGPModel, self).__init__(train_x, train_y, likelihood)
         self.mean_module = mean_type()
@@ -303,6 +305,13 @@ class SOGPModel(gp.models.ExactGP):
             self.covar_module = gp.kernels.ScaleKernel(covar_module)
         else:
             self.covar_module = covar_module
+
+        self.dim = train_x.shape[-1]
+        if n_inducing_points is not None:
+            self.covar_module = gp.kernels.InducingPointKernel(self.covar_module, torch.randn(n_inducing_points, self.dim), likelihood)
+            init_locations = initialize_inducing_points(X=train_x, M=n_inducing_points, with_qmc=False, seed=0)
+            self.covar_module.inducing_points = torch.nn.Parameter(init_locations)
+
         self.likelihood = likelihood
 
 
@@ -318,3 +327,16 @@ class SOGPModel(gp.models.ExactGP):
             A MarginalLogLikelihood object for the model
         """
         return gp.mlls.ExactMarginalLogLikelihood(self.likelihood, self)
+    
+    def kernel_cond( self ) -> Tensor:
+        """
+        Computes the condition number of the training kernel matrix.
+        Returns:
+            The condition number of the training kernel matrix
+        """
+        with torch.no_grad():
+            if not self.prediction_strategy:
+                self.eval()
+                __ = self(torch.zeros_like(self.train_inputs[0])) # to initialize the prediction strategy
+            K_plus = self.prediction_strategy.lik_train_train_covar.evaluate_kernel().to_dense()
+        return torch.linalg.cond(K_plus)
