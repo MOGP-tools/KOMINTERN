@@ -302,6 +302,7 @@ class ProjectedGPModel(ExactGPModel):
         self.shape_batch = batch_shape
         self.latent_dim = -1
         self.last_target_dim_is_datapoint = last_target_dim_is_datapoint
+        self.noise_thresh = noise_thresh
 
 
     def projected_noise( self )-> Tensor:
@@ -397,6 +398,8 @@ class ProjectedGPModel(ExactGPModel):
             extra_D_term = extra_D_term_root @ extra_D_term_root.mT
             D_term_rotated = torch.diag_embed(sigma_p) + extra_D_term
             D_term = QR @ D_term_rotated @ QR.mT
+            if diag:
+                D_term = torch.diagonal(D_term, dim1=-2, dim2=-1)
         else:
             M_term = 0.
             D_term_root = QR * torch.sqrt(sigma_p.unsqueeze(-2))
@@ -407,8 +410,9 @@ class ProjectedGPModel(ExactGPModel):
                                                              rank=0, has_global_noise=False)
             if sigma_p.is_cuda:
                 res.cuda()
-            diag_M_term = torch.diagonal(M_term, dim1=-2, dim2=-1) if self._has_M_term else 0. 
-            res.task_noises = B_term + D_term + 2 * diag_M_term
+            diag_M_term = torch.diagonal(M_term, dim1=-2, dim2=-1) if self._has_M_term else 0.
+            diag_noises = B_term + D_term + 2 * diag_M_term
+            res.task_noises = torch.clamp(diag_noises, min= 2 * self.noise_thresh)
         else:
             Mt_term = M_term.mT if self._has_M_term else 0.
             Sigma = D_term + M_term + Mt_term + B_term
