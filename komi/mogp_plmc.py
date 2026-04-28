@@ -499,6 +499,14 @@ class ProjectedGPModel(ExactGPModel):
                 loo_var = loo_var @ lmc_coeffs**2
         return loo_var, loo_delta
 
+    def latent_variance( self, X:Tensor ) -> Tensor :
+        output = self.likelihood(self.compute_latent_distrib(X))
+        return output.variance.mT
+
+    def task_variance (self, X:Tensor ) -> Tensor :
+        output = self.full_likelihood()(self.__call__(X))
+        return output.variance
+
 
     def set_train_data( self, inputs:Tensor, targets:Tensor, strict:bool=True, last_target_dim_is_datapoint:Union[bool, None]=None):
         """
@@ -509,6 +517,8 @@ class ProjectedGPModel(ExactGPModel):
         projected_data = self.project_data(targets, last_data_dim_is_datapoint=last_target_dim_is_datapoint)
         super().set_train_data(inputs=inputs, targets=projected_data, strict=strict)
         self.train_y = targets if self.last_target_dim_is_datapoint == last_target_dim_is_datapoint else targets.mT
+        if self.scalar_B and not self._has_M_term :
+            self.Y_squared_norm = torch.linalg.matrix_norm(self.train_y) ** 2
 
     
     def save( self, extra_terms=False) -> dict:
