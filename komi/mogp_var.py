@@ -257,6 +257,11 @@ class VariationalMultitaskGPModel(gp.models.ApproximateGP):
             K_plus = self.variational_strategy.base_variational_strategy.pseudo_points[0]
         return torch.linalg.cond(K_plus)
 
+    def set_train_data( self, X, Y, strict:bool=False ) -> None:
+        pass
+
+    def task_variance( self, X:Tensor) -> Tensor :
+        return self.likelihood(self.__call__(X)).variance
     
     def save( self, extra_terms = False) -> dict:
         """
@@ -305,6 +310,3 @@ class VariationalMultitaskGPModel(gp.models.ApproximateGP):
             return TransposedVariationalELBO(self.likelihood, self, num_data=self.n_points)
         else:
             return gp.mlls.VariationalELBO(self.likelihood, self, num_data=self.n_points)
-
-
-
