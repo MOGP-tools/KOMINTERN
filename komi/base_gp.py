@@ -1,44 +1,52 @@
-from functools import reduce #, lru_cache
-from typing import Union, List, Tuple
 import warnings
-import numpy as np
-import torch
+from functools import reduce  # , lru_cache
+from typing import List, Tuple, Union
+
 import gpytorch as gp
-from gpytorch.means.mean import Mean
+import torch
 from gpytorch.kernels.kernel import Kernel
 from gpytorch.likelihoods.likelihood import Likelihood
+from gpytorch.means.mean import Mean
 from gpytorch.mlls.marginal_log_likelihood import MarginalLogLikelihood
-from gpytorch.models.exact_prediction_strategies import prediction_strategy
 from torch import Tensor
 
-from utilities import handle_covar_ , get_median_heuristic_ard, CustomMultitaskGaussianLikelihood, initialize_inducing_points
+from .utilities import (
+    CustomMultitaskGaussianLikelihood,
+    get_median_heuristic_ard,
+    handle_covar_,
+    initialize_inducing_points,
+)
+
 
 class ExactGPModel(gp.models.ExactGP):
     """
     Standard exact GP model. Can handle independant multitasking via batch dimensions
     """
-    def __init__( self,
-                  train_x:Tensor,
-                  train_y:Tensor,
-                  likelihood:Union[Likelihood,None]=None,
-                  kernel_type:Kernel=gp.kernels.RBFKernel,
-                  mean_type:Mean=gp.means.ConstantMean,
-                  decomp:Union[List[List[int]], None]=None,
-                  disc_ranks:Tuple[int,...]=(),
-                  outputscales:bool=False,
-                  noise_thresh:float=1e-4,
-                  n_inducing_points:Union[int,None]=None,
-                  batch_lik:Union[bool,None]=None,
-                  lik_mat_rank:int=0,
-                  last_target_dim_is_datapoint:bool=False,
-                  ignore_n_tasks:bool=False,
-                  prior_scales:Union[Tensor, None]=None,
-                  prior_width:Union[Tensor, None]=None,
-                  init_induc_with_qmc:bool=False,
-                  ker_kwargs:Union[dict,None]=None,
-                  jitter_val:float=1e-6,
-                  seed:int=0,
-                  **kwargs ):
+
+    def __init__(
+        self,
+        train_x: Tensor,
+        train_y: Tensor,
+        likelihood: Union[Likelihood, None] = None,
+        kernel_type: Kernel = gp.kernels.RBFKernel,
+        mean_type: Mean = gp.means.ConstantMean,
+        decomp: Union[List[List[int]], None] = None,
+        disc_ranks: Tuple[int, ...] = (),
+        outputscales: bool = False,
+        noise_thresh: float = 1e-4,
+        n_inducing_points: Union[int, None] = None,
+        batch_lik: Union[bool, None] = None,
+        lik_mat_rank: int = 0,
+        last_target_dim_is_datapoint: bool = False,
+        ignore_n_tasks: bool = False,
+        prior_scales: Union[Tensor, None] = None,
+        prior_width: Union[Tensor, None] = None,
+        init_induc_with_qmc: bool = False,
+        ker_kwargs: Union[dict, None] = None,
+        jitter_val: float = 1e-6,
+        seed: int = 0,
+        **kwargs,
+    ):
         """
         Args:
             train_x: training input data
@@ -60,13 +68,13 @@ class ExactGPModel(gp.models.ExactGP):
             jitter_val: jitter value for the Cholesky decomposition of the kernel matrix in specific leave-one-out computations. Defaults to 1e-6.
         """
         if len(train_y.shape) == 1:
-            train_y = train_y.view(1,-1) # add a task axis
+            train_y = train_y.view(1, -1)  # add a task axis
 
         if last_target_dim_is_datapoint:
             *batch_shape, n_tasks, n_points = train_y.shape
         else:
             *batch_shape, n_points, n_tasks = train_y.shape
-            
+
         if ignore_n_tasks:
             output_batch_shape = torch.Size(batch_shape)
         else:
@@ -75,21 +83,31 @@ class ExactGPModel(gp.models.ExactGP):
         multilik_batch_shape = torch.Size(batch_shape)
 
         if batch_lik is None:
-            batch_lik = ( len(batch_shape) < 2 or batch_shape == (1,1) )
+            batch_lik = len(batch_shape) < 2 or batch_shape == (1, 1)
         if likelihood is None:
             noise_init = 1e-1
-            if batch_lik :
-                likelihood = gp.likelihoods.GaussianLikelihood(batch_shape=lik_batch_shape, noise_constraint=gp.constraints.GreaterThan(noise_thresh))
+            if batch_lik:
+                likelihood = gp.likelihoods.GaussianLikelihood(
+                    batch_shape=lik_batch_shape,
+                    noise_constraint=gp.constraints.GreaterThan(noise_thresh),
+                )
                 likelihood.noise = noise_init * torch.ones_like(likelihood.noise)
             else:
-                likelihood = CustomMultitaskGaussianLikelihood(num_tasks=n_tasks, batch_shape=multilik_batch_shape,
-                                                                        has_global_noise=False,
-                                                                        rank=lik_mat_rank,
-                                                                        noise_constraint=gp.constraints.GreaterThan(noise_thresh))
-                likelihood.task_noises = torch.ones_like(likelihood.task_noises) * noise_init
+                likelihood = CustomMultitaskGaussianLikelihood(
+                    num_tasks=n_tasks,
+                    batch_shape=multilik_batch_shape,
+                    has_global_noise=False,
+                    rank=lik_mat_rank,
+                    noise_constraint=gp.constraints.GreaterThan(noise_thresh),
+                )
+                likelihood.task_noises = (
+                    torch.ones_like(likelihood.task_noises) * noise_init
+                )
                 if lik_mat_rank > 0:
-                    likelihood.task_noise_covar_factor = torch.nn.Parameter(torch.zeros_like(likelihood.task_noise_covar_factor))
-                
+                    likelihood.task_noise_covar_factor = torch.nn.Parameter(
+                        torch.zeros_like(likelihood.task_noise_covar_factor)
+                    )
+
         super(ExactGPModel, self).__init__(train_x, train_y, likelihood)
 
         # Initialization of the lenghtscales
@@ -101,29 +119,47 @@ class ExactGPModel(gp.models.ExactGP):
         self.dim = train_x.shape[-1]
         self.n_tasks = n_tasks
         self.batch_lik = batch_lik
-        self.mean_module = mean_type(input_size=self.dim, batch_shape=output_batch_shape)
-        self.covar_module = handle_covar_(kernel_type, dim=self.dim, decomp=decomp, disc_ranks=disc_ranks,
-                                          prior_scales=prior_scales, prior_width=prior_width, outputscales=outputscales,
-                                          batch_shape=output_batch_shape, ker_kwargs=ker_kwargs)
+        self.mean_module = mean_type(
+            input_size=self.dim, batch_shape=output_batch_shape
+        )
+        self.covar_module = handle_covar_(
+            kernel_type,
+            dim=self.dim,
+            decomp=decomp,
+            disc_ranks=disc_ranks,
+            prior_scales=prior_scales,
+            prior_width=prior_width,
+            outputscales=outputscales,
+            batch_shape=output_batch_shape,
+            ker_kwargs=ker_kwargs,
+        )
         if n_inducing_points is not None:
-            self.covar_module = gp.kernels.InducingPointKernel(self.covar_module, torch.randn(n_inducing_points, self.dim), likelihood)
-            induc_locations = initialize_inducing_points(X=train_x, M=n_inducing_points, with_qmc=init_induc_with_qmc, seed=seed)
+            self.covar_module = gp.kernels.InducingPointKernel(
+                self.covar_module, torch.randn(n_inducing_points, self.dim), likelihood
+            )
+            induc_locations = initialize_inducing_points(
+                X=train_x, M=n_inducing_points, with_qmc=init_induc_with_qmc, seed=seed
+            )
             self.covar_module.inducing_points = torch.nn.Parameter(induc_locations)
-        
+
         if jitter_val is None:
             self.jitter_val = gp.settings.cholesky_jitter.value(train_x.dtype)
         else:
             self.jitter_val = jitter_val
 
-
-    def forward( self, x:Tensor )-> Union[gp.distributions.MultivariateNormal, gp.distributions.MultitaskMultivariateNormal]:
+    def forward(
+        self, x: Tensor
+    ) -> Union[
+        gp.distributions.MultivariateNormal,
+        gp.distributions.MultitaskMultivariateNormal,
+    ]:
         """
         Defines the computation performed at every call.
         Args:
             x: Data to evaluate the model at
 
         Returns:
-            Prior distribution of the model output at the input locations. Can be a multitask multivariate normal if batch dimension is >1 
+            Prior distribution of the model output at the input locations. Can be a multitask multivariate normal if batch dimension is >1
             and the model was instanciated with batch_lik = False, or a (batch) multivariate normal otherwise
         """
         mean_x = self.mean_module(x)
@@ -131,34 +167,48 @@ class ExactGPModel(gp.models.ExactGP):
         if self.batch_lik:
             return gp.distributions.MultivariateNormal(mean_x, covar_x)
         else:
-            return gp.distributions.MultitaskMultivariateNormal.from_batch_mvn(gp.distributions.MultivariateNormal(mean_x, covar_x))
+            return gp.distributions.MultitaskMultivariateNormal.from_batch_mvn(
+                gp.distributions.MultivariateNormal(mean_x, covar_x)
+            )
 
-
-    def lscales( self, unpacked:bool=True )-> Union[List[Tensor], Tensor]:  # returned format : n_kernels x n_dims
+    def lscales(
+        self, unpacked: bool = True
+    ) -> Union[List[Tensor], Tensor]:  # returned format : n_kernels x n_dims
         """
         Displays the learned characteric lengthscales of the kernel(s).
         Args:
-            unpacked: whether to unpack the output list and trim useless dimensions of the tensor. 
+            unpacked: whether to unpack the output list and trim useless dimensions of the tensor.
             Applies only if the model kernel is not composite. Defaults to True
 
         Returns:
             A list of tensors representing the learned characteristic lengthscales of each subkernel and each task (or a single tensor if the kernel is non-composite and unpacked=True).
             Each one has shape n_tasks x n_dims (n_dim number of dimensions of the subkernel)
         """
-        if hasattr(self.covar_module, 'kernels'):
+        if hasattr(self.covar_module, "kernels"):
             n_kernels = len(self.covar_module.kernels)
             ref_kernel = self.covar_module.kernels[0]
-            attr_name = 'base_kernel.lengthscale.data' if hasattr(ref_kernel, 'base_kernel') else 'lengthscale.data'
-            scales = [reduce(getattr, attr_name.split('.'), ker).squeeze() for ker in self.covar_module.kernels]
+            attr_name = (
+                "base_kernel.lengthscale.data"
+                if hasattr(ref_kernel, "base_kernel")
+                else "lengthscale.data"
+            )
+            scales = [
+                reduce(getattr, attr_name.split("."), ker).squeeze()
+                for ker in self.covar_module.kernels
+            ]
         else:
             n_kernels = 1
             ref_kernel = self.covar_module
-            attr_name = 'base_kernel.lengthscale.data' if hasattr(ref_kernel, 'base_kernel') else 'lengthscale.data'
-            scales = reduce(getattr, attr_name.split('.'), self.covar_module).squeeze()
+            attr_name = (
+                "base_kernel.lengthscale.data"
+                if hasattr(ref_kernel, "base_kernel")
+                else "lengthscale.data"
+            )
+            scales = reduce(getattr, attr_name.split("."), self.covar_module).squeeze()
 
-        return [scales] if (n_kernels==1 and not unpacked) else scales
+        return [scales] if (n_kernels == 1 and not unpacked) else scales
 
-    def outputscale( self, unpacked:bool=False)-> Tensor:
+    def outputscale(self, unpacked: bool = False) -> Tensor:
         """
         Displays the outputscale(s) of the kernel(s).
         Args:
@@ -168,17 +218,25 @@ class ExactGPModel(gp.models.ExactGP):
             A tensor representing the learned outputscales of each subkernel and each task (shape n_tasks x n_kernels)
         """
         # TODO : adapt to the batch case
-        n_kernels = len(self.covar_module.kernels) if hasattr(self.covar_module, 'kernels') else 1
-        n_funcs = self.n_latents if hasattr(self, 'n_latents') else self.n_tasks  ## to distinguish between the projected and batch-exact cases
+        n_kernels = (
+            len(self.covar_module.kernels)
+            if hasattr(self.covar_module, "kernels")
+            else 1
+        )
+        n_funcs = (
+            self.n_latents if hasattr(self, "n_latents") else self.n_tasks
+        )  ## to distinguish between the projected and batch-exact cases
         res = torch.zeros((n_funcs, n_kernels))
-        if n_kernels > 1 :
+        if n_kernels > 1:
             for i_ker in range(n_kernels):
-                res[:, i_ker] = self.covar_module.kernels[i_ker].outputscale.data.squeeze()
+                res[:, i_ker] = self.covar_module.kernels[
+                    i_ker
+                ].outputscale.data.squeeze()
         else:
-            res[:,0] = self.covar_module.outputscale.data.squeeze()
-        return res.squeeze() if (n_kernels==1 and unpacked) else res
-    
-    def kernel_cond( self ) -> Tensor:
+            res[:, 0] = self.covar_module.outputscale.data.squeeze()
+        return res.squeeze() if (n_kernels == 1 and unpacked) else res
+
+    def kernel_cond(self) -> Tensor:
         """
         Computes the condition number of the training kernel matrix.
         Returns:
@@ -187,10 +245,12 @@ class ExactGPModel(gp.models.ExactGP):
         with torch.no_grad():
             if not self.prediction_strategy:
                 self.eval()
-                __ = self(torch.zeros_like(self.train_inputs[0])) # to initialize the prediction strategy
+                __ = self(
+                    torch.zeros_like(self.train_inputs[0])
+                )  # to initialize the prediction strategy
             K_plus = self.prediction_strategy.lik_train_train_covar.evaluate_kernel().to_dense()
         return torch.linalg.cond(K_plus)
-    
+
     def compute_loo(self, output=None, complex_mean=False) -> Tuple[Tensor, Tensor]:
         """
         Computes the leave-one-out (LOO) variance and error gaps (y_true - y_loo) values for the model.
@@ -207,7 +267,7 @@ class ExactGPModel(gp.models.ExactGP):
         eps = self.jitter_val
         if self.n_tasks > 1:
             loo_var, loo_delta = torch.zeros_like(train_y), torch.zeros_like(train_y)
-            ## The following blocks are leads for a more efficient implementation of the LOO computation in the multitask case. 
+            ## The following blocks are leads for a more efficient implementation of the LOO computation in the multitask case.
             ## Not yet functional because of bugs in gpytorch
             ###
             # K = likelihood(output).to_data_independent_dist().lazy_covariance_matrix
@@ -220,11 +280,15 @@ class ExactGPModel(gp.models.ExactGP):
             # loo_delta = L._cholesky_solve(targets.unsqueeze(-1), upper=False).squeeze(-1) * loo_var
             # loo_var, loo_delta = loo_var.detach().T, loo_delta.detach().T
             ###
-            if hasattr(output.lazy_covariance_matrix, 'base_linear_op'):
-                Kbatch = output.lazy_covariance_matrix.base_linear_op.evaluate() # to be removed later. A bug in gpytorch makes this necessary
+            if hasattr(output.lazy_covariance_matrix, "base_linear_op"):
+                Kbatch = (
+                    output.lazy_covariance_matrix.base_linear_op.evaluate()
+                )  # to be removed later. A bug in gpytorch makes this necessary
             else:
                 Kbatch = output.lazy_covariance_matrix.evaluate()
-            global_noise = likelihood.noise.squeeze().data if hasattr(likelihood, 'noise') else 0
+            global_noise = (
+                likelihood.noise.squeeze().data if hasattr(likelihood, "noise") else 0
+            )
             m = self.mean_module(train_x).reshape(*train_y.shape)
             targets = (train_y - m).T
             for i in range(self.n_tasks):
@@ -232,46 +296,79 @@ class ExactGPModel(gp.models.ExactGP):
                 noise = global_noise + likelihood.task_noises.squeeze().data[i]
                 identity = torch.eye(*K.shape[-2:], dtype=K.dtype, device=K.device)
                 K += noise * identity
-                while eps < 1e6 * self.jitter_val: # this is a hack to avoid numerical instability
+                while (
+                    eps < 1e6 * self.jitter_val
+                ):  # this is a hack to avoid numerical instability
                     try:
                         L = K.cholesky(upper=False)
                         break
                     except:
                         eps *= 10
                         K += eps * identity
-                        warnings.warn('Cholesky decomposition failed. Increasing jitter to {}'.format(eps))
+                        warnings.warn(
+                            "Cholesky decomposition failed. Increasing jitter to {}".format(
+                                eps
+                            )
+                        )
                 L = torch.linalg.cholesky(K, upper=False)
-                loo_var[:,i] = 1.0 / torch.cholesky_solve(identity[None,:], L, upper=False).diagonal(dim1=-1, dim2=-2)
-                loo_delta[:,i] = torch.cholesky_solve(targets[i].unsqueeze(-1), L, upper=False).squeeze(-1) * loo_var[:,i]
+                loo_var[:, i] = 1.0 / torch.cholesky_solve(
+                    identity[None, :], L, upper=False
+                ).diagonal(dim1=-1, dim2=-2)
+                loo_delta[:, i] = (
+                    torch.cholesky_solve(
+                        targets[i].unsqueeze(-1), L, upper=False
+                    ).squeeze(-1)
+                    * loo_var[:, i]
+                )
             loo_var, loo_delta = loo_var.detach(), loo_delta.detach()
 
-        else: # single-output case
+        else:  # single-output case
             # m, K, noise_it = self.mean_module(train_x), output.lazy_covariance_matrix, self.likelihood.noise.data
-            m, K = self.mean_module(train_x), self.likelihood(output).lazy_covariance_matrix
+            m, K = (
+                self.mean_module(train_x),
+                self.likelihood(output).lazy_covariance_matrix,
+            )
             m = m.reshape(*train_y.shape)
             identity = torch.eye(*K.shape[-2:], dtype=K.dtype, device=K.device)
             with gp.settings.cholesky_max_tries(3):
                 if complex_mean:
-                    if not hasattr(self.mean_module, 'basis_matrix'):
-                        raise ValueError('A complex mean treatment was required, but the model mean function doesn\'t allow it !')
-                    else: # This has not been thoroughly tested yet
+                    if not hasattr(self.mean_module, "basis_matrix"):
+                        raise ValueError(
+                            "A complex mean treatment was required, but the model mean function doesn't allow it !"
+                        )
+                    else:  # This has not been thoroughly tested yet
                         K_factors = K.cholesky(upper=False)
-                        K_inv = K_factors._cholesky_solve(identity, upper=False).squeeze()
+                        K_inv = K_factors._cholesky_solve(
+                            identity, upper=False
+                        ).squeeze()
                         H = self.mean_module.basis_matrix(train_x)
                         M = torch.mm(torch.mm(H.T, K_inv), H)
-                        M_factors = torch.linalg.cholesky(M + eps, upper=False)  # Now this is a Torch method, not a gp one (M is not a lazy matrix anymore)
-                        identity_bis = torch.eye(*M.shape[-2:], dtype=M.dtype, device=M.device)
-                        M_inv = torch.cholesky_solve(identity_bis, M_factors, upper=False)
+                        M_factors = torch.linalg.cholesky(
+                            M + eps, upper=False
+                        )  # Now this is a Torch method, not a gp one (M is not a lazy matrix anymore)
+                        identity_bis = torch.eye(
+                            *M.shape[-2:], dtype=M.dtype, device=M.device
+                        )
+                        M_inv = torch.cholesky_solve(
+                            identity_bis, M_factors, upper=False
+                        )
                         K_minus = K_inv - K_inv @ H @ M_inv @ H.T @ K_inv
                         loo_var = 1.0 / K_minus.diagonal(dim1=-1, dim2=-2)
                         loo_delta = K_minus @ train_y * loo_var
                 else:
                     L = K.cholesky(upper=False)
-                    loo_var = 1.0 / L._cholesky_solve(identity, upper=False).diagonal(dim1=-1, dim2=-2)
-                    loo_delta = L._cholesky_solve((train_y - m).unsqueeze(-1), upper=False).squeeze(-1) * loo_var
+                    loo_var = 1.0 / L._cholesky_solve(identity, upper=False).diagonal(
+                        dim1=-1, dim2=-2
+                    )
+                    loo_delta = (
+                        L._cholesky_solve(
+                            (train_y - m).unsqueeze(-1), upper=False
+                        ).squeeze(-1)
+                        * loo_var
+                    )
 
         return loo_var, loo_delta
-    
+
     def default_mll(self) -> MarginalLogLikelihood:
         """
         Returns the default marginal log likelihood (loss function) object for the model.
@@ -282,20 +379,24 @@ class ExactGPModel(gp.models.ExactGP):
 
 
 class SOGPModel(gp.models.ExactGP):
-    def __init__( self,
-                  train_x:Tensor,
-                  train_y:Tensor,
-                  likelihood:Union[Likelihood,None]=None,
-                  kernel_type:Kernel=gp.kernels.RBFKernel,
-                  mean_type:Mean=gp.means.ConstantMean,
-                  noise_thresh:float=1e-4,
-                  ker_kwargs:Union[dict,None]=None,
-                  outputscales:bool=True,
-                  n_inducing_points:int|None = None,
-                  **kwargs ):
+    def __init__(
+        self,
+        train_x: Tensor,
+        train_y: Tensor,
+        likelihood: Union[Likelihood, None] = None,
+        kernel_type: Kernel = gp.kernels.RBFKernel,
+        mean_type: Mean = gp.means.ConstantMean,
+        noise_thresh: float = 1e-4,
+        ker_kwargs: Union[dict, None] = None,
+        outputscales: bool = True,
+        n_inducing_points: int | None = None,
+        **kwargs,
+    ):
         noise_init = 0.1
         if likelihood is None:
-            likelihood = gp.likelihoods.GaussianLikelihood(noise_constraint=gp.constraints.Interval(noise_thresh, 0.2))
+            likelihood = gp.likelihoods.GaussianLikelihood(
+                noise_constraint=gp.constraints.Interval(noise_thresh, 0.2)
+            )
             likelihood.noise = noise_init * torch.ones_like(likelihood.noise)
         super(SOGPModel, self).__init__(train_x, train_y, likelihood)
         self.mean_module = mean_type()
@@ -308,12 +409,15 @@ class SOGPModel(gp.models.ExactGP):
 
         self.dim = train_x.shape[-1]
         if n_inducing_points is not None:
-            self.covar_module = gp.kernels.InducingPointKernel(self.covar_module, torch.randn(n_inducing_points, self.dim), likelihood)
-            init_locations = initialize_inducing_points(X=train_x, M=n_inducing_points, with_qmc=False, seed=0)
+            self.covar_module = gp.kernels.InducingPointKernel(
+                self.covar_module, torch.randn(n_inducing_points, self.dim), likelihood
+            )
+            init_locations = initialize_inducing_points(
+                X=train_x, M=n_inducing_points, with_qmc=False, seed=0
+            )
             self.covar_module.inducing_points = torch.nn.Parameter(init_locations)
 
         self.likelihood = likelihood
-
 
     def forward(self, x):
         mean_x = self.mean_module(x)
@@ -327,8 +431,8 @@ class SOGPModel(gp.models.ExactGP):
             A MarginalLogLikelihood object for the model
         """
         return gp.mlls.ExactMarginalLogLikelihood(self.likelihood, self)
-    
-    def kernel_cond( self ) -> Tensor:
+
+    def kernel_cond(self) -> Tensor:
         """
         Computes the condition number of the training kernel matrix.
         Returns:
@@ -337,6 +441,8 @@ class SOGPModel(gp.models.ExactGP):
         with torch.no_grad():
             if not self.prediction_strategy:
                 self.eval()
-                __ = self(torch.zeros_like(self.train_inputs[0])) # to initialize the prediction strategy
+                __ = self(
+                    torch.zeros_like(self.train_inputs[0])
+                )  # to initialize the prediction strategy
             K_plus = self.prediction_strategy.lik_train_train_covar.evaluate_kernel().to_dense()
         return torch.linalg.cond(K_plus)

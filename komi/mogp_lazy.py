@@ -1,16 +1,14 @@
-from functools import reduce #, lru_cache
-from typing import Union, List, Tuple
-import warnings
-import torch
-from torch import Tensor
+from typing import List, Tuple, Union
+
 import gpytorch as gp
+import torch
 from gpytorch.likelihoods import Likelihood
 from linear_operator.operators import KroneckerProductLinearOperator, RootLinearOperator
-from linear_operator.operators.dense_linear_operator import to_linear_operator
-from sklearn.decomposition import TruncatedSVD
+from torch import Tensor
 
 from .base_gp import ExactGPModel
 from .utilities import SplineKernel, compute_truncated_svd
+
 
 class LazyLMCModel(ExactGPModel):
     """
@@ -19,14 +17,17 @@ class LazyLMCModel(ExactGPModel):
     while these kernels are in reality identical ; therefore, all kernel-based operations are redundant.
     This should be improved in future versions.
     """
-    def __init__( self,
-                  train_x:Tensor,
-                  train_y:Tensor,
-                  n_latents:int,
-                  noise_val:float=1e-7,
-                  store_full_y:bool=False,
-                  jitter_val:float=1e-8,
-                  **kwargs):
+
+    def __init__(
+        self,
+        train_x: Tensor,
+        train_y: Tensor,
+        n_latents: int,
+        noise_val: float = 1e-7,
+        store_full_y: bool = False,
+        jitter_val: float = 1e-8,
+        **kwargs,
+    ):
         """
         Args:
             train_x: training input data
@@ -41,24 +42,38 @@ class LazyLMCModel(ExactGPModel):
         latent_batch_shape = torch.Size([*batch_shape, n_latents])
         multilik_batch_shape = torch.Size(batch_shape)
 
-        proj_likelihood = gp.likelihoods.GaussianLikelihood(batch_shape=latent_batch_shape,
-                                noise_constraint=gp.constraints.GreaterThan(0.5 * noise_val))
+        proj_likelihood = gp.likelihoods.GaussianLikelihood(
+            batch_shape=latent_batch_shape,
+            noise_constraint=gp.constraints.GreaterThan(0.5 * noise_val),
+        )
         proj_likelihood.noise = noise_val
-        
+
         U, S, V = compute_truncated_svd(Y=train_y, n_latents=n_latents)
         lmc_coeffs = (U * S.unsqueeze(-2)).mT
         proj_y = V.mT
 
-        super().__init__(train_x=train_x, train_y=proj_y, likelihood=proj_likelihood, kernel_type=SplineKernel,
-                         mean_type=gp.means.ZeroMean, outputscales=False, n_inducing_points=None, batch_lik=True, **kwargs)
+        super().__init__(
+            train_x=train_x,
+            train_y=proj_y,
+            likelihood=proj_likelihood,
+            kernel_type=SplineKernel,
+            mean_type=gp.means.ZeroMean,
+            outputscales=False,
+            n_inducing_points=None,
+            batch_lik=True,
+            **kwargs,
+        )
         # !! proj_likelihood will only be named likelihood in the model
 
-        self.register_buffer('lmc_coeffs', lmc_coeffs)
+        self.register_buffer("lmc_coeffs", lmc_coeffs)
         if store_full_y:
-            self.register_buffer('train_y', train_y)
-        self.full_lik = gp.likelihoods.MultitaskGaussianLikelihood(num_tasks=n_tasks, batch_shape=multilik_batch_shape,
-                                                                   has_global_noise=False,
-                                                    noise_constraint=gp.constraints.GreaterThan(noise_val))
+            self.register_buffer("train_y", train_y)
+        self.full_lik = gp.likelihoods.MultitaskGaussianLikelihood(
+            num_tasks=n_tasks,
+            batch_shape=multilik_batch_shape,
+            has_global_noise=False,
+            noise_constraint=gp.constraints.GreaterThan(noise_val),
+        )
         self.full_lik.task_noises = noise_val
         self.n_tasks = n_tasks
         self.n_latents = n_latents
@@ -70,21 +85,20 @@ class LazyLMCModel(ExactGPModel):
         else:
             self.jitter_val = jitter_val
 
-
-    def projected_noise( self )-> Tensor:
+    def projected_noise(self) -> Tensor:
         """
-        Returns a vector of size n_latents containing the modeled noises of latent processes. 
+        Returns a vector of size n_latents containing the modeled noises of latent processes.
         """
         return self.likelihood.noise.squeeze(-1)
-    
+
     # @lru_cache(maxsize=None) # caching projected data and projected matrix is appealing, but it messes with backpropagation. No workaround has been found yet
-    def projection_matrix( self )-> Tensor:
+    def projection_matrix(self) -> Tensor:
         """
-        Returns the matrix T of shape n_tasks x n_latents, such that YT is the "projected data" seen by latent processes 
+        Returns the matrix T of shape n_tasks x n_latents, such that YT is the "projected data" seen by latent processes
         """
         return self.lmc_coeffs.mT
 
-    def project_data( self, data) -> Tensor:
+    def project_data(self, data) -> Tensor:
         """
         Projects data into the latent space.
         Args:
@@ -93,20 +107,22 @@ class LazyLMCModel(ExactGPModel):
             A tensor of shape n_latents x n_points, which is the projection of the input data in the latent space.
             This shape convention corresponds to the batch treatment in gpytorch, not to the usual convention.
         """
-        if hasattr(self, 'train_y') and data is self.train_y:
+        if hasattr(self, "train_y") and data is self.train_y:
             return self.train_targets
         else:
-            return (data @ self.projection_matrix()).mT # shape n_latents x n_points ; opposite convention to most other quantities !!
+            return (
+                data @ self.projection_matrix()
+            ).mT  # shape n_latents x n_points ; opposite convention to most other quantities !!
 
-    def full_likelihood( self, **kwargs ) -> Likelihood :
+    def full_likelihood(self, **kwargs) -> Likelihood:
         """
         Returns the full likelihood of the model, which is a multitask Gaussian likelihood.
         Returns:
             A multitask Gaussian likelihood.
         """
         return self.full_lik
-    
-    def lmc_coefficients( self ) -> Tensor:
+
+    def lmc_coefficients(self) -> Tensor:
         """
         Returns the mixing matrix of the LMC model, which is a tensor of shape n_latents x n_tasks.
         Returns:
@@ -114,7 +130,7 @@ class LazyLMCModel(ExactGPModel):
         """
         return self.lmc_coeffs
 
-    def forward( self, x:Tensor )-> gp.distributions.MultivariateNormal:
+    def forward(self, x: Tensor) -> gp.distributions.MultivariateNormal:
         """
         Computes the prior distribution of the latent processes at the input locations. ! This does not return task-level values !
         Args:
@@ -126,7 +142,9 @@ class LazyLMCModel(ExactGPModel):
         covar_x = self.covar_module(x)
         return gp.distributions.MultivariateNormal(mean_x, covar_x)
 
-    def compute_latent_distrib( self, x:Tensor, **kwargs )-> gp.distributions.MultivariateNormal:
+    def compute_latent_distrib(
+        self, x: Tensor, **kwargs
+    ) -> gp.distributions.MultivariateNormal:
         """
         Outputs (distributional) posterior values of the latent processes at the input locations.
         Args:
@@ -136,8 +154,10 @@ class LazyLMCModel(ExactGPModel):
             A batched gp multivariate normal distribution representing latent processes values, which mean has shape n_latents x n_points.
         """
         return ExactGPModel.__call__(self, x, **kwargs)  # shape n_latents x n_points
-    
-    def compute_loo(self, output=None, latent=False, train_y=None) -> Tuple[Tensor, Tensor]:
+
+    def compute_loo(
+        self, output=None, latent=False, train_y=None
+    ) -> Tuple[Tensor, Tensor]:
         """
         Computes the leave-one-out (LOO) variance and error gaps (y_true - y_loo) values for the model.
         Args:
@@ -149,46 +169,58 @@ class LazyLMCModel(ExactGPModel):
         """
         # TODO : adapt to the batch case
         if not latent:
-            if hasattr(self, 'train_y'):
+            if hasattr(self, "train_y"):
                 train_y = self.train_y
             elif train_y is None:
-                raise ValueError("The training labels must be provided to compute the task-level leave-one-out errors.\
-                                 You can either provide them as an argument or store them in the model by instanciating it with store_full_y=True.")
+                raise ValueError(
+                    "The training labels must be provided to compute the task-level leave-one-out errors.\
+                                 You can either provide them as an argument or store them in the model by instanciating it with store_full_y=True."
+                )
         train_x = self.train_inputs[0]
-        with torch.no_grad(), gp.settings.cholesky_max_tries(10), gp.settings.cg_tolerance(1e-2), gp.settings.eval_cg_tolerance(1e-2):
+        with (
+            torch.no_grad(),
+            gp.settings.cholesky_max_tries(10),
+            gp.settings.cg_tolerance(1e-2),
+            gp.settings.eval_cg_tolerance(1e-2),
+        ):
             if output is None:
                 output = self.compute_latent_distrib(train_x)
             K = self.likelihood(output).lazy_covariance_matrix
             y_proj = self.train_targets
             identity = torch.eye(*K.shape[-2:], dtype=K.dtype, device=K.device)
             L = K.cholesky(upper=False)
-            loo_var = 1.0 / L._cholesky_solve(identity[None,:], upper=False).diagonal(dim1=-1, dim2=-2)
-            loo_delta = L._cholesky_solve(y_proj.unsqueeze(-1), upper=False).squeeze(-1) * loo_var
+            loo_var = 1.0 / L._cholesky_solve(identity[None, :], upper=False).diagonal(
+                dim1=-1, dim2=-2
+            )
+            loo_delta = (
+                L._cholesky_solve(y_proj.unsqueeze(-1), upper=False).squeeze(-1)
+                * loo_var
+            )
             loo_var, loo_delta = loo_var.mT, loo_delta.mT
             if not latent:
                 lmc_coeffs = self.lmc_coefficients()
-                e_loo_raw = (loo_delta @ lmc_coeffs)
-                diff = (train_y - y_proj.mT @ lmc_coeffs)
+                e_loo_raw = loo_delta @ lmc_coeffs
+                diff = train_y - y_proj.mT @ lmc_coeffs
                 loo_delta = e_loo_raw + diff
                 loo_var = loo_var @ lmc_coeffs**2
         return loo_var, loo_delta
 
-
-    def set_train_data( self, inputs:Tensor, targets:Tensor, strict:bool=True ):
+    def set_train_data(self, inputs: Tensor, targets: Tensor, strict: bool = True):
         """
         Replaces the current training data of the model. Overrides the parent method to store the training labels in the model and the new LMC coefficients
         deduced from them.
         """
-        U, S, V = compute_truncated_svd(Y=self.train_y, n_latents=self.n_latents, axes_layout=self.axes_layout)
+        U, S, V = compute_truncated_svd(
+            Y=self.train_y, n_latents=self.n_latents, axes_layout=self.axes_layout
+        )
         lmc_coeffs = (U * S).mT
         proj_y = V
         super().set_train_data(inputs=inputs, targets=proj_y.mT, strict=strict)
         self.lmc_coeffs = lmc_coeffs
-        if hasattr(self, 'train_y'):
+        if hasattr(self, "train_y"):
             self.train_y = targets
 
-
-    def save( self, extra_terms=False) -> dict:
+    def save(self, extra_terms=False) -> dict:
         """
         Saves the model in a dictionary. The saved elements are strictly sufficient to make mean predictions (not variances).
         !! As of now, this method cannot accommodate : non-gaussian likelihoods and additional kernel settings !!
@@ -199,17 +231,20 @@ class LazyLMCModel(ExactGPModel):
         """
         self.eval()
         dico = {}
-        dico['lmc_coeffs'] = self.lmc_coeffs.tolist()
+        dico["lmc_coeffs"] = self.lmc_coeffs.tolist()
         with torch.no_grad():
-            _ = self(torch.zeros_like(self.train_inputs[0])) # this is to compute the mean cache
-        dico['mean_cache'] = self.prediction_strategy.mean_cache.tolist()
+            _ = self(
+                torch.zeros_like(self.train_inputs[0])
+            )  # this is to compute the mean cache
+        dico["mean_cache"] = self.prediction_strategy.mean_cache.tolist()
         if extra_terms:
-            dico['noise_val'] = self.noise_val
+            dico["noise_val"] = self.noise_val
 
         return dico
 
-
-    def __call__(self, x:Tensor, **kwargs)-> gp.distributions.MultitaskMultivariateNormal:
+    def __call__(
+        self, x: Tensor, **kwargs
+    ) -> gp.distributions.MultitaskMultivariateNormal:
         """
         Outputs the full posterior distribution of the model at input locations. This is used to make predictions.
         Args:
@@ -218,19 +253,23 @@ class LazyLMCModel(ExactGPModel):
         Returns:
             A multitask multivariate gp normal distribution representing task processes values, which mean has shape n_points x n_tasks.
         """
-        if self.training: # in training mode, we just compute the prior distribution of latent processes
+        if self.training:  # in training mode, we just compute the prior distribution of latent processes
             return super().__call__(x, **kwargs)
-        
+
         latent_dist = ExactGPModel.__call__(self, x, **kwargs)
 
         num_batch = len(latent_dist.batch_shape)
         latent_dim = num_batch + self.latent_dim
 
         num_dim = num_batch + len(latent_dist.event_shape)
-        lmc_coefficients = self.lmc_coefficients().expand(*latent_dist.batch_shape, self.lmc_coefficients().size(-1))
+        lmc_coefficients = self.lmc_coefficients().expand(
+            *latent_dist.batch_shape, self.lmc_coefficients().size(-1)
+        )
 
         # Mean: ... x N x n_tasks
-        latent_mean = latent_dist.mean.permute(*range(0, latent_dim), *range(latent_dim + 1, num_dim), latent_dim)
+        latent_mean = latent_dist.mean.permute(
+            *range(0, latent_dim), *range(latent_dim + 1, num_dim), latent_dim
+        )
         mean = latent_mean @ lmc_coefficients.permute(
             *range(0, latent_dim), *range(latent_dim + 1, num_dim - 1), latent_dim, -1
         )
@@ -243,4 +282,3 @@ class LazyLMCModel(ExactGPModel):
         covar = covar.add_jitter(self.jitter_val)
 
         return gp.distributions.MultitaskMultivariateNormal(mean, covar)
-
